@@ -40344,6 +40344,24 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
 
 #include "argodrive_profile.h"
 
+/* Argodrive: the two Engram row reads are 48 uncached 264-byte preads issued
+ * before layer 0 and first consumed at layer 1. DS4_ARGODRIVE_ENGRAM_ASYNC=1
+ * issues them on a concurrent queue and joins right before that first use, so
+ * layer 0's GPU work hides them. Same rows, same order; only the wait moves. */
+#include <dispatch/dispatch.h>
+typedef struct { const ds4_engram_table *table; const uint32_t *ids; float *rows; unsigned readers; int ok; } ar_engram_job;
+static void ar_engram_job_run(void *ctx) {
+    ar_engram_job *j = (ar_engram_job *)ctx;
+    j->ok = ds4_engram_read_parallel(j->table, j->ids, DS4_ENGRAM_COLS, j->rows, j->readers) ? 1 : 0;
+}
+static int ar_engram_async_enabled(void) {
+    static int checked, on;
+    if (!checked) { const char *e = getenv("DS4_ARGODRIVE_ENGRAM_ASYNC"); on = e && strcmp(e, "0") != 0; checked = 1; }
+    return on;
+}
+#define AR_ENGRAM_JOIN() do { if (ar_eg_group) { dispatch_group_wait(ar_eg_group, DISPATCH_TIME_FOREVER); \
+    dispatch_release(ar_eg_group); ar_eg_group = NULL; \
+    for (unsigned ar_i = 0; ar_i < ar_eg_n; ar_i++) if (!ar_eg[ar_i].ok) ar_eg_ok = 0; } } while (0)
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
@@ -40368,14 +40386,21 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         fprintf(stderr,"ds4: Argodrive Engram readers=%u\n",ar_engram_readers);
         ar_engram_announced=ar_engram_readers;
     }
+    ar_engram_job ar_eg[2]; dispatch_group_t ar_eg_group = NULL; unsigned ar_eg_n = 0; int ar_eg_ok = 1;
+    const int ar_eg_async = ar_engram_async_enabled();
     for (uint32_t i = 0; !ds41_image_at(g, g->pos) && i < 2; i++) {
-        if (!ds4_engram_read_parallel(&g->table[i], ids[i], DS4_ENGRAM_COLS,
-                                     g->rows[i], ar_engram_readers)) return false;
+        if (ar_eg_async) {
+            if (!ar_eg_group) ar_eg_group = dispatch_group_create();
+            ar_eg[i] = (ar_engram_job){&g->table[i], ids[i], g->rows[i], ar_engram_readers, 0};
+            dispatch_group_async_f(ar_eg_group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &ar_eg[i], ar_engram_job_run);
+            ar_eg_n = i + 1;
+        } else if (!ds4_engram_read_parallel(&g->table[i], ids[i], DS4_ENGRAM_COLS,
+                                            g->rows[i], ar_engram_readers)) return false;
     }
     if (ar_profile) ar_time.engram = now_sec() - ar_start;
     const float initial_pre[] = {1, 0, 0, 0};
     if (!ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) ||
-        !ds4_gpu_begin_commands()) return false;
+        !ds4_gpu_begin_commands()) { AR_ENGRAM_JOIN(); return false; }
     bool ok = ds41_embed(g, m, w, g->residual, g->x, token, g->pos);
     /* Unfused quality kernels bind whole expert tensors. Keep just the current
      * layer mapped, using the same admitted reserve as layer-major prefill. */
@@ -40394,7 +40419,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
         if (ok && ds41_engram_layer(il)) {
             const uint32_t i = il == 1 ? 0 : 1;
-            ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
+            AR_ENGRAM_JOIN();
+            if (!ar_eg_ok) ok = false;
+            if (ok) ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
         }
         double ar_mark = ar_profile ? now_sec() : 0;
         if (ok) ok = ds41_graph_layer(g, m, l, il, token);
@@ -40414,6 +40441,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (ok && drain && !layer_resident && il + 1u < DS4_N_LAYER)
             ok = ds4_gpu_begin_commands() != 0;
     }
+    AR_ENGRAM_JOIN();
+    if (!ar_eg_ok) ok = false;
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
