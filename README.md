@@ -1,5 +1,22 @@
 # Argodrive DeepSeek V4.1 benchmark engine
 
+**DeepSeek V4.1 Flash (518 GB, 4-bit) streamed from SSD on a 128 GB MacBook Pro M5 Max — 512-token prompt, 200 generated, output SHA-256 identical to upstream on every arm:**
+
+| | prompt processing tok/s | steady decode tok/s |
+|---|---:|---:|
+| upstream ds4, internal SSD only | 16.23 | 10.59 |
+| this fork, internal SSD only | **28.04** (1.73×) | **14.38** (1.36×) |
+| this fork, + one external NVMe | 36.88 (2.27×) | 16.05 (1.52×) |
+| this fork, + two external NVMe | **43.62** (2.69×) | **17.38** (1.64×) |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="argodrive/charts/ladder-dark.svg">
+  <img src="argodrive/charts/ladder.svg" alt="Prompt processing and steady decode, upstream vs this fork on one, two and three drives">
+</picture>
+
+The single-drive row needs no extra hardware: commit 38e200a lets the selective prefill path run on one source. Details, method and raw arms: [argonautlabs.ai/research](https://argonautlabs.ai/research/deepseek-2026-09-15.html) · tooling: [ArgoDrive](https://github.com/argonautlabsai/argodrive).
+
+
 Built on [ds4 by Salvatore Sanfilippo (antirez) and contributors](https://github.com/antirez/ds4), with experimental streaming changes and [ARGODRIVE tooling](https://github.com/argonautlabsai/argodrive). Original licences and upstream acknowledgements are preserved; see [credits](CREDITS.md).
 
 This branch includes the actual expert replica reader and Metal scheduling changes used by the V4.1 benchmarks. No separate provider library is required. It is pinned to upstream `bd66c402070042bf0a79ad6ece8242de4c93680c`. The earlier `argonaut-v41` branch contains a different GLM integration and is not this benchmark engine.
