@@ -39310,11 +39310,26 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     for (uint32_t i = 0; i < 2; i++) {
         const uint32_t il = i ? 14u : 1u;
         const ds4_tensor *table = required_tensorf(m, "blk.%u.engram_embd.weight", il);
-        if (!ds4_engram_table_open(&g->table[i], path, table->abs_offset, g->engram.rows[i])) goto fail;
+        /* Argodrive: DS4_ARGODRIVE_ENGRAM_PATHS=a,b serves table i from replica i (a
+         * byte-identical copy of the GGUF), taking 48 random 4 KiB reads per token off
+         * the primary drive. Offsets are the same file layout; same size is required. */
+        char ar_ep_buf[4096]; const char *ar_tpath = path;
+        { const char *ar_ep = getenv("DS4_ARGODRIVE_ENGRAM_PATHS");
+          if (ar_ep && *ar_ep) {
+              snprintf(ar_ep_buf, sizeof(ar_ep_buf), "%s", ar_ep);
+              char *ar_tok[8] = {0}; unsigned ar_n = 0; char *ar_save = NULL;
+              for (char *t = strtok_r(ar_ep_buf, ",", &ar_save); t && ar_n < 8; t = strtok_r(NULL, ",", &ar_save)) ar_tok[ar_n++] = t;
+              if (ar_n) ar_tpath = ar_tok[i % ar_n];
+          } }
+        if (ar_tpath != path) fprintf(stderr, "ds4: Argodrive Engram table %u from %s\n", i, ar_tpath);
+        if (!ds4_engram_table_open(&g->table[i], ar_tpath, table->abs_offset, g->engram.rows[i])) goto fail;
         struct stat weights_stat, rows_stat;
-        if (fstat(m->fd, &weights_stat) || fstat(g->table[i].fd, &rows_stat) ||
-            weights_stat.st_dev != rows_stat.st_dev || weights_stat.st_ino != rows_stat.st_ino)
-            goto fail;
+        if (fstat(m->fd, &weights_stat) || fstat(g->table[i].fd, &rows_stat)) goto fail;
+        if (ar_tpath == path) {
+            if (weights_stat.st_dev != rows_stat.st_dev || weights_stat.st_ino != rows_stat.st_ino) goto fail;
+        } else if (weights_stat.st_size != rows_stat.st_size) {
+            fprintf(stderr, "ds4: Argodrive Engram replica %s is not the same size as the model\n", ar_tpath); goto fail;
+        }
         const uint64_t bytes = (uint64_t)DS4_N_EMBD * DS4_N_HC * 4;
         g->engram_q_norm[i] = ds4_gpu_tensor_alloc(bytes);
         g->engram_k_norm[i] = ds4_gpu_tensor_alloc(bytes);
@@ -39476,6 +39491,21 @@ static bool ds41_hash_tokens(ds41_gpu_graph *g, ds4_engram_history *history,
     }
     const bool ok = ds4_engram_hash(&g->engram, history, tokens, mask, count, ids);
     free(mask);
+    /* Argodrive: DS4_ARGODRIVE_ENGRAM_TRACE=<path> appends one line per lookup,
+     * "pos table col row", prefill and decode alike, for the Engram heat map. */
+    if (ok) {
+        static FILE *ar_tr; static int ar_tr_checked;
+        if (!ar_tr_checked) { const char *e = getenv("DS4_ARGODRIVE_ENGRAM_TRACE"); if (e && *e) ar_tr = fopen(e, "a"); ar_tr_checked = 1; }
+        if (ar_tr) {
+            for (uint32_t t = 0; t < count; t++)
+                for (uint32_t l = 0; l < DS4_ENGRAM_LAYERS; l++)
+                    for (uint32_t c = 0; c < DS4_ENGRAM_COLS; c++) {
+                        const uint32_t r = ids[(t * DS4_ENGRAM_LAYERS + l) * DS4_ENGRAM_COLS + c];
+                        if (r != (uint32_t)DS4_ENGRAM_DEAD) fprintf(ar_tr, "%u %u %u %u\n", g->pos + t, l, c, r);
+                    }
+            fflush(ar_tr);
+        }
+    }
     return ok;
 }
 
