@@ -8,14 +8,14 @@
 | this fork, internal SSD only | **28.04** (1.73×) | **14.38** (1.36×) |
 | this fork, + one external NVMe | 36.88 (2.27×) | 16.05 (1.52×) |
 | this fork, + two external NVMe | **43.62** (2.69×) | **17.38** (1.64×) |
-| this fork, + two external NVMe, GPU keep-alive (2026-09-17, default in the profile) | 44.02 (2.71×) | **17.93** (1.69×) |
+| this fork, + two external NVMe, GPU keep-alive (2026-09-17, default in the profile) | 44.28 (2.73×) | **18.06** (1.71×) |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="argodrive/charts/ladder-dark.svg">
   <img src="argodrive/charts/ladder.svg" alt="Prompt processing and steady decode, upstream vs this fork on one, two and three drives">
 </picture>
 
-The keep-alive row: `DS4_ARGODRIVE_GAP_KEEPALIVE=1` with `DS4_TP_KEEPALIVE_TGS=8` (commit 361289f) runs a tiny ALU kernel on a second queue only while the CPU waits for expert reads, because the GPU otherwise drops into low-power states during those waits and every kernel after them runs slower. Four interleaved pairs at 512/200, all positive (+0.31, +0.65, +0.84, +0.54 tok/s), medians 17.34 → 17.93, output identical. Continuous spinning gains nothing. The chart above predates this row.
+The keep-alive row: `DS4_ARGODRIVE_GAP_KEEPALIVE=1` with `DS4_TP_KEEPALIVE_TGS=8` (commit 361289f) runs a tiny ALU kernel on a second queue only while the CPU waits for expert reads, because the GPU otherwise drops into low-power states during those waits and every kernel after them runs slower. Four interleaved pairs at 512/200, all positive (+0.31, +0.65, +0.84, +0.54 tok/s), medians 17.34 → 17.93; a shorter spin (`DS4_TP_KEEPALIVE_ITERS=300000`, so the kernel stops sooner when a read lands) adds another four positive pairs, 17.80 → 18.06, output identical. Continuous spinning gains nothing. The chart above predates this row.
 
 The single-drive row needs no extra hardware: commit 38e200a lets the selective prefill path run on one source. Details, method and raw arms: [argonautlabs.ai/research](https://argonautlabs.ai/research/deepseek-2026-09-15.html) · tooling: [ArgoDrive](https://github.com/argonautlabsai/argodrive).
 
