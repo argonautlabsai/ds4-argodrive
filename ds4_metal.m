@@ -10612,6 +10612,34 @@ static void *ds4_gpu_tp_keepalive_thread(void *arg) {
     return NULL;
 }
 
+/* Argodrive: DS4_ARGODRIVE_GAP_KEEPALIVE=1 runs the ALU keep-alive only while the
+ * CPU waits for expert reads (the GPU is idle and its clocks sag; the trace showed
+ * 32%% of decode in reduced performance states); =2 runs it continuously. */
+static uint32_t ds4_gpu_tp_keepalive_tgs_from_env(void);
+static int g_ar_keepalive_mode = -1;
+static int ds4_gpu_argodrive_keepalive_mode(void) {
+    if (g_ar_keepalive_mode < 0) { const char *e = getenv("DS4_ARGODRIVE_GAP_KEEPALIVE"); g_ar_keepalive_mode = e ? atoi(e) : 0; }
+    return g_ar_keepalive_mode;
+}
+static void ds4_gpu_argodrive_keepalive_start(void) {
+    static int started;
+    if (started) return; started = 1;
+    if (ds4_gpu_argodrive_keepalive_mode() <= 0 || g_tp_keepalive_running) return;
+    uint32_t ka_tgs = ds4_gpu_tp_keepalive_tgs_from_env();
+    g_tp_keepalive_paused = ds4_gpu_argodrive_keepalive_mode() == 1;   /* gap mode starts paused */
+    g_tp_keepalive_queue = [g_device newCommandQueue];
+    g_tp_keepalive_buffer = [g_device newBufferWithLength:(NSUInteger)ka_tgs * 256u * sizeof(float) options:MTLResourceStorageModeShared];
+    if (g_tp_keepalive_queue && g_tp_keepalive_buffer &&
+        pthread_create(&g_tp_keepalive_thread, NULL, ds4_gpu_tp_keepalive_thread, NULL) == 0) {
+        g_tp_keepalive_running = 1;
+        fprintf(stderr, "ds4: Argodrive keep-alive started (mode %d, %u threadgroups)\n", ds4_gpu_argodrive_keepalive_mode(), ka_tgs);
+    }
+}
+static void ds4_gpu_argodrive_keepalive_gap(int in_gap) {
+    if (ds4_gpu_argodrive_keepalive_mode() != 1) return;
+    ds4_gpu_argodrive_keepalive_start();
+    if (g_tp_keepalive_running) g_tp_keepalive_paused = !in_gap;
+}
 static void *ds4_gpu_tp_service_thread(void *arg) {
     (void)arg;
     const bool profile = getenv("DS4_TP_GATE_PROFILE") != NULL;
@@ -13904,8 +13932,10 @@ static int ds4_gpu_stream_expert_pread_pool_begin(
     return 1;
 }
 
+static void ds4_gpu_argodrive_keepalive_gap(int in_gap);
 static int ds4_gpu_stream_expert_pread_pool_wait(void) {
     if (!g_stream_expert_pread_pool_initialized) return 0;
+    ds4_gpu_argodrive_keepalive_gap(1);
 
     pthread_mutex_lock(&g_stream_expert_pread_pool_mutex);
     while (g_stream_expert_pread_pool_remaining_workers != 0) {
@@ -13913,6 +13943,7 @@ static int ds4_gpu_stream_expert_pread_pool_wait(void) {
                           &g_stream_expert_pread_pool_mutex);
     }
     pthread_mutex_unlock(&g_stream_expert_pread_pool_mutex);
+    ds4_gpu_argodrive_keepalive_gap(0);
     return 1;
 }
 
