@@ -8,7 +8,8 @@
 | this fork, internal SSD only | **28.04** (1.73×) | **14.38** (1.36×) |
 | this fork, + one external NVMe | 36.88 (2.27×) | 16.05 (1.52×) |
 | this fork, + two external NVMe | **43.62** (2.69×) | **17.38** (1.64×) |
-| this fork, + two external NVMe, GPU keep-alive (2026-09-17, default in the profile) | 44.28 (2.73×) | **18.06** (1.71×) |
+| this fork, + two external NVMe, GPU keep-alive (2026-09-17) | 44.28 (2.73×) | **18.06** (1.71×) |
+| this fork, + two external NVMe, GPU keep-alive, decode split 10:6:6 + CPU keep-alive (2026-09-19, default in the profile) | 45.34 (2.79×) | **18.45** (1.74×) |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="argodrive/charts/ladder-dark.svg">
@@ -16,6 +17,8 @@
 </picture>
 
 The keep-alive row: `DS4_ARGODRIVE_GAP_KEEPALIVE=1` with `DS4_TP_KEEPALIVE_TGS=8` (commit 361289f) runs a tiny ALU kernel on a second queue only while the CPU waits for expert reads, because the GPU otherwise drops into low-power states during those waits and every kernel after them runs slower. Four interleaved pairs at 512/200, all positive (+0.31, +0.65, +0.84, +0.54 tok/s), medians 17.34 → 17.93; a shorter spin (`DS4_TP_KEEPALIVE_ITERS=300000`, so the kernel stops sooner when a read lands) adds another four positive pairs, 17.80 → 18.06, output identical. Continuous spinning gains nothing. The chart above predates this row.
+
+The 2026-09-19 row adds two knobs found with `powermetrics`. `DS4_ARGODRIVE_DECODE_WEIGHTS=10,6,6` (commit 743616f) gives decode its own split across the three drives while prefill keeps 10:5:5: at 10:5:5 the internal SSD was the last drive to land on two thirds of the decode reads, at 10:6:6 on four tenths, and 10:7:7 overshoots. `DS4_ARGODRIVE_CPU_KEEPALIVE=1` (commit d04ca6a) starts one busy thread at user-interactive QoS when decode begins: the engine's threads spend most of each token waiting, the performance cores sit at their 1344 MHz floor, and the one thread that does the per-layer bookkeeping ran at 3.4 GHz; with a busy neighbour its cluster holds 4.2 GHz. The stack against the 09-17 champion, four interleaved pairs at 512/200: +0.53, +0.56, +0.62, +0.69 tok/s, medians 17.84 → 18.45, output SHA identical on all eight arms, prefill unchanged, about 4.5 W more CPU power. The champion configuration measured 17.8-17.9 that night against 18.06 two days earlier, inside the ±2% floor of this workload.
 
 The single-drive row needs no extra hardware: commit 38e200a lets the selective prefill path run on one source. Details, method and raw arms: [argonautlabs.ai/research](https://argonautlabs.ai/research/deepseek-2026-09-15.html) · tooling: [ArgoDrive](https://github.com/argonautlabsai/argodrive).
 
