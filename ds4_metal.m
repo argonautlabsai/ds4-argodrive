@@ -902,6 +902,7 @@ static int ds4_gpu_stream_expert_cache_note_expert_size(
 static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void);
 static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats);
 static void ds4_gpu_stream_expert_pending_load_clear(void);
+static void ds4_gpu_argodrive_qos_self(void);
 static void ds4_gpu_stream_expert_pread_pool_shutdown(void);
 static int ds4_gpu_stream_expert_timing_summary_enabled(void);
 static int ds4_gpu_stream_expert_cache_entry_protected(
@@ -10574,6 +10575,7 @@ static uint32_t ds4_gpu_tp_keepalive_tgs_from_env(void) {
 
 static void *ds4_gpu_tp_keepalive_thread(void *arg) {
     (void)arg;
+    ds4_gpu_argodrive_qos_self();
     /* Swept on the M5 Max pair: too few iterations lets clocks sag.  Current
      * TP split-resident Flash runs show 1.2M is a small Q4/Q2 decode win over
      * 800k, while two threadgroups waste work. */
@@ -13794,9 +13796,55 @@ static int ds4_gpu_stream_expert_pread_pool_enabled(void) {
     return !(env && strcmp(env, "0") == 0);
 }
 
+/* Argodrive 2026-09-19: DS4_ARGODRIVE_QOS=1 pins the decode thread, the expert
+ * read pool and the keep-alive thread to user-interactive QoS. The slow mode seen
+ * on 09-18/19 (15.7-16.4 vs 17.7-18.1, same binary) had unchanged GPU spans and
+ * unchanged pread times but a 3x slower expert prepare and 5 ms/token more CPU
+ * time in the layer loop: the bursty threads were being scheduled at low
+ * priority / on efficiency cores. */
+/* Argodrive 2026-09-19: DS4_ARGODRIVE_CPU_KEEPALIVE=N runs N busy threads at
+ * user-interactive QoS from the first decode expert load on. powermetrics showed
+ * the P-clusters parked at 1344 MHz (their floor) for 90-100% of decode: the
+ * engine's threads mostly wait on condition variables and the DVFS governor
+ * never raises the cluster. A busy core on the same cluster keeps it up, so the
+ * CPU work between GPU command buffers (prepare, install, submit, wake-ups) runs
+ * at speed. Costs one core each; the M5 Max has 16. */
+static pthread_t g_ar_cpu_keepalive_threads[4];
+static volatile int g_ar_cpu_keepalive_stop;
+static int g_ar_cpu_keepalive_started;
+static void *ds4_gpu_argodrive_cpu_keepalive_thread(void *arg) {
+    (void)arg;
+    (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    volatile double sink = 1.0;
+    while (!g_ar_cpu_keepalive_stop) {
+        for (int i = 0; i < 100000; i++) sink = sink * 1.0000001 + 0.5;
+    }
+    return NULL;
+}
+static void ds4_gpu_argodrive_cpu_keepalive_start(void) {
+    if (g_ar_cpu_keepalive_started) return;
+    g_ar_cpu_keepalive_started = 1;
+    const char *e = getenv("DS4_ARGODRIVE_CPU_KEEPALIVE");
+    int n = e ? atoi(e) : 0;
+    if (n <= 0) return;
+    if (n > 4) n = 4;
+    for (int i = 0; i < n; i++)
+        (void)pthread_create(&g_ar_cpu_keepalive_threads[i], NULL, ds4_gpu_argodrive_cpu_keepalive_thread, NULL);
+    fprintf(stderr, "ds4: Argodrive CPU keep-alive started (%d busy thread%s)\n", n, n == 1 ? "" : "s");
+}
+static int ds4_gpu_argodrive_qos_enabled(void) {
+    static int checked, on;
+    if (!checked) { const char *e = getenv("DS4_ARGODRIVE_QOS"); on = e && strcmp(e, "0") != 0; checked = 1; }
+    return on;
+}
+static void ds4_gpu_argodrive_qos_self(void) {
+    if (ds4_gpu_argodrive_qos_enabled())
+        (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+}
 static void *ds4_gpu_stream_expert_pread_pool_worker(void *arg) {
     const uint32_t worker_index = (uint32_t)(uintptr_t)arg;
     uint64_t seen_generation = 0;
+    ds4_gpu_argodrive_qos_self();
 
     for (;;) {
         pthread_mutex_lock(&g_stream_expert_pread_pool_mutex);
@@ -16867,6 +16915,8 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         const int32_t                     *selected_ids,
         uint32_t                           n_selected) {
     ar_set_decode_phase(1);
+    { static int qos_done; if (!qos_done) { qos_done = 1; ds4_gpu_argodrive_qos_self(); } }
+    ds4_gpu_argodrive_cpu_keepalive_start();
     if (!g_ssd_streaming_mode ||
         getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_EARLY_LOAD") != NULL) {
         return 1;
