@@ -12877,6 +12877,7 @@ int ar_prefill_release(void) {
  * read-ahead thread when the GPU is busy with the previous layer. The set being
  * filled is never the published one, so no GPU consumer can see a partial fill. */
 static int ar_prefill_fill(unsigned set, const uint64_t offsets[3], const uint64_t sizes[3]) {
+    ar_set_decode_phase(0);
     for (unsigned i=0;i<3;i++) {
         if (!ar_prefill_pool[set][i] || ar_prefill_pool_bytes[set][i]<sizes[i]) {
             ar_prefill_pool[set][i]=nil; ar_prefill_pool_bytes[set][i]=0;
@@ -12927,6 +12928,7 @@ typedef struct { uint64_t src, dst, len; } ar_prefill_piece;
 
 static int ar_prefill_fill_pieces(unsigned set, unsigned i,
                                   const ar_prefill_piece *pieces, uint32_t n_pieces) {
+    ar_set_decode_phase(0);
     if (!n_pieces) return 1;
     uint8_t *dst = (uint8_t *)[ar_prefill_pool[set][i] contents];
     if (!dst) return 0;
@@ -16864,6 +16866,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected) {
+    ar_set_decode_phase(1);
     if (!g_ssd_streaming_mode ||
         getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_EARLY_LOAD") != NULL) {
         return 1;

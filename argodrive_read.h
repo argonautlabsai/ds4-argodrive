@@ -16,7 +16,16 @@
 
 /* reads/lands_last/gap_ns: barrier attribution, see ar_read. Trailing fields
  * so the positional initialisers below keep zeroing them. */
-typedef struct { int fd; unsigned weight; uint64_t bytes; uint64_t reads, lands_last, gap_ns; } ar_source;
+typedef struct { int fd; unsigned weight; uint64_t bytes; uint64_t reads, lands_last, gap_ns; unsigned decode_weight; } ar_source;
+/* Argodrive 2026-09-19: DS4_ARGODRIVE_DECODE_WEIGHTS="10,6,6" (primary first, then the
+ * replicas in DS4_ARGODRIVE_REPLICAS order) gives decode its own split; prefill keeps the
+ * base weights. The engine flips ar_decode_phase at the first decode expert load and
+ * clears it when a prefill stage begins. */
+static volatile int g_ar_decode_phase;
+static void ar_set_decode_phase(int on) { g_ar_decode_phase = on ? 1 : 0; }
+static unsigned ar_effective_weight(const ar_source *src) {
+    return (g_ar_decode_phase && src->decode_weight) ? src->decode_weight : src->weight;
+}
 typedef struct { ar_source source[3]; unsigned count; int invalid; int owns_primary; uint64_t size; } ar_reader;
 typedef struct { uint64_t offset, length; } ar_piece;
 
@@ -99,6 +108,15 @@ static int ar_open(ar_reader *r, int primary, const char *paths, const char *wei
     }
     free(copy);
     if(!ok || r->count<2) {ar_close(r);r->invalid=1;return 0;}
+    {   /* optional decode-phase split, e.g. "10,6,6" */
+        const char *dw=getenv("DS4_ARGODRIVE_DECODE_WEIGHTS");
+        if(dw && dw[0]) {
+            unsigned parsed[3]={0,0,0}; unsigned n=0; const char *c=dw; int good=1;
+            while(*c && n<3) { char *end=NULL; unsigned long v=strtoul(c,&end,10); if(end==c || v==0 || v>100) {good=0;break;} parsed[n++]=(unsigned)v; c=end; if(*c==',') c++; else if(*c) {good=0;break;} }
+            if(good && n==r->count) { for(unsigned i=0;i<r->count;i++) r->source[i].decode_weight=parsed[i]; fprintf(stderr,"ds4: Argodrive decode split %s (prefill keeps the base weights)\n",dw); }
+            else fprintf(stderr,"ds4: ignoring DS4_ARGODRIVE_DECODE_WEIGHTS=%s (want %u comma-separated weights 1..100)\n",dw,r->count);
+        }
+    }
     r->invalid=0;return 1;
 }
 static int ar_plan(const ar_reader *r, uint64_t offset, uint64_t length, ar_piece out[3]) {
@@ -106,8 +124,9 @@ static int ar_plan(const ar_reader *r, uint64_t offset, uint64_t length, ar_piec
     const uint64_t block=256*1024;
     uint64_t blocks=length/block, counts[3]={0}, remainder[3]={0}, assigned=0;
     unsigned total=0;
-    for(unsigned i=0;i<r->count;i++) {if(!r->source[i].weight || r->source[i].weight>100) return 0;total+=r->source[i].weight;}
-    for(unsigned i=0;i<r->count;i++) {counts[i]=blocks*r->source[i].weight/total;remainder[i]=blocks*r->source[i].weight%total;assigned+=counts[i];}
+    unsigned w[3]={0,0,0};
+    for(unsigned i=0;i<r->count;i++) {w[i]=ar_effective_weight(&r->source[i]);if(!w[i] || w[i]>100) return 0;total+=w[i];}
+    for(unsigned i=0;i<r->count;i++) {counts[i]=blocks*w[i]/total;remainder[i]=blocks*w[i]%total;assigned+=counts[i];}
     while(assigned<blocks) {
         unsigned best=0;for(unsigned i=1;i<r->count;i++) if(remainder[i]>remainder[best]) best=i;
         counts[best]++;remainder[best]=0;assigned++;
