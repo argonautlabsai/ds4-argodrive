@@ -53,8 +53,8 @@ def parse_result(path, prompt_tokens, output_tokens):
 
 
 def plan(engine, model, prompt, out, prompt_tokens=512, output_tokens=128):
-    if prompt_tokens not in (512, 2048) or output_tokens not in (60, 128, 512):
-        raise ValueError('Supported preparation rungs: 512/2048 prompt, 60/128/512 generation.')
+    if prompt_tokens not in (512, 2048) or output_tokens not in (60, 128, 200, 512):
+        raise ValueError('Supported preparation rungs: 512/2048 prompt, 60/128/200/512 generation.')
     paths = [Path(x).expanduser().resolve() for x in (engine, model, prompt, out)]
     engine, model, prompt, out = paths
     if not engine.is_file() or not os.access(engine, os.X_OK) or not prompt.is_file():
@@ -143,12 +143,49 @@ def swap_used_mb():
     return float(found[1]) * {'K':1/1024, 'M':1, 'G':1024}[found[2]]
 
 
-def run(p, timeout=1800, replicas=(), verification_receipt=None, primary_weight=2, sampler_binary=None, devices=None, experimental_env=None, max_swap_growth_mb=None):
+def observe_cache(raw, expected=None):
+    """Requested cache size is not proof that its mlock-backed allocation held."""
+    budgets = [int(x) for x in re.findall(rb'streaming expert cache budget=(\d+) experts', raw)]
+    reduced = b'using locked cache cap:' in raw or b'runtime cache cap now ' in raw
+    return {'requested_experts': expected, 'observed_budgets': budgets,
+            'allocation_reduced': reduced,
+            'matches_requested': None if expected is None else
+                bool(budgets) and all(x == expected for x in budgets) and not reduced}
+
+
+def wait_sampler_ready(process, csv_path, log_path, devices, timeout=5.0):
+    """Never start inference before the sampler has a baseline for every disk."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if process.poll() is not None:
+            raise RuntimeError('SSD sampler exited before its baseline was ready.')
+        try:
+            marker = 'ARGODRIVE_SAMPLER_START_MONO ' in Path(log_path).read_text()
+            rows = Path(csv_path).read_text().splitlines()
+            seen = set()
+            for row in rows:
+                fields = row.split(',')
+                if len(fields) >= 5 and fields[1] in devices.values():
+                    float(fields[0]); int(fields[2]); int(fields[3])
+                    seen.add(fields[1])
+            if marker and set(devices.values()) <= seen:
+                return
+        except (OSError, ValueError):
+            pass  # The sampler may still be creating or flushing its first row.
+        if time.monotonic() >= deadline:
+            raise RuntimeError('SSD sampler did not provide all drive baselines before timeout.')
+        time.sleep(0.05)
+
+
+def run(p, timeout=1800, replicas=(), verification_receipt=None, primary_weight=2, sampler_binary=None, devices=None, experimental_env=None, max_swap_growth_mb=None, replica_weights=None):
     if not 30 <= timeout <= 1800:
         raise ValueError('Timeout must be 30–1800 seconds.')
     if max_swap_growth_mb is not None and not 0 < max_swap_growth_mb <= 1024:
         raise ValueError('Swap-growth guard must be between 0 and 1024 MiB.')
     replicas = [str(Path(x).resolve()) for x in replicas]
+    replica_weights = [1] * len(replicas) if replica_weights is None else list(replica_weights)
+    if len(replica_weights) != len(replicas) or any(type(w) is not int or not 1 <= w <= 100 for w in replica_weights):
+        raise ValueError('Choose one integer weight in 1..100 for each replica.')
     if len(replicas)>2 or len(set([p['model_path'], *replicas])) != len(replicas)+1:
         raise ValueError('Choose up to two different replica paths.')
     if any(any(c in x for c in ',*\n\r') for x in replicas) or not 1 <= primary_weight <= 100:
@@ -164,17 +201,19 @@ def run(p, timeout=1800, replicas=(), verification_receipt=None, primary_weight=
                'DS4_METAL_STREAMING_EXPERT_PREAD_THREADS', 'DS4_ARGODRIVE_PRIMARY_NOCACHE', 'DS4_ARGODRIVE_RESIDENT_GATE', 'DS4_ARGODRIVE_PRECOMMIT', 'DS4_ARGODRIVE_FLAT_READS', 'DS4_ARGODRIVE_Q8_BF16', 'DS4_ARGODRIVE_Q8_ROWS', 'DS4_ARGODRIVE_EARLY_EVENT',
                'DS4_METAL_CB_TIMES', 'DS4_METAL_GPU_BUSY_PROFILE',
                'DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD',
-               'DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY'}
+               'DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY',
+               'DS4_ARGODRIVE_DECODE_WEIGHTS', 'DS4_ARGODRIVE_CPU_KEEPALIVE', 'DS4_ARGODRIVE_GAP_KEEPALIVE', 'DS4_TP_KEEPALIVE_TGS', 'DS4_TP_KEEPALIVE_ITERS', 'DS4_ARGODRIVE_ENGRAM_ASYNC', 'DS4_ARGODRIVE_PREFILL_SPLIT', 'DS4_ARGODRIVE_PREFILL_SELECTIVE', 'DS4_ARGODRIVE_PREFILL_AHEAD', 'DS4_ARGODRIVE_PREFILL_LANES'}
     if any(k not in allowed or not isinstance(v, str) or '\0' in v
            for k, v in experimental_env.items()):
         raise ValueError('Unsupported experimental environment setting.')
     if sampler_binary and (not Path(sampler_binary).is_file() or not devices or any(not re.fullmatch(r'disk[0-9]+', d) for d in devices.values())):
         raise ValueError('Sampler requires a verified binary and physical whole-disk map.')
     p = {**p, 'sampler':str(sampler_binary) if sampler_binary else None, 'physical_devices':devices, 'method':'expert split reads' if replicas else 'single-source',
-         'replica_streaming':bool(replicas), 'replicas':replicas, 'primary_weight':primary_weight,
+         'replica_streaming':bool(replicas), 'replicas':replicas, 'primary_weight':primary_weight, 'replica_weights':replica_weights,
          'verification_receipt':str(verification_receipt) if verification_receipt else None,
          'experimental_environment':experimental_env}
     p['max_swap_growth_mb'] = max_swap_growth_mb
+    expected_cache = p.get('cache', {}).get('experts') if isinstance(p.get('cache'), dict) else None
     if replicas:
         p['notes'] = ['Experimental expert-only split reads; Engram remains on primary.', 'All replica files require full-checksum receipts. Speed and output qualification remain separate.']
     out = Path(p['output_directory'])
@@ -211,7 +250,7 @@ def run(p, timeout=1800, replicas=(), verification_receipt=None, primary_weight=
         env = {k:v for k,v in os.environ.items() if not k.startswith(('DS4_', 'GLM_', 'K3_'))}
         env.update(experimental_env)
         if replicas:
-            env['DS4_ARGODRIVE_REPLICAS'] = ','.join(x+'*1' for x in replicas)
+            env['DS4_ARGODRIVE_REPLICAS'] = ','.join(x+'*'+str(w) for x,w in zip(replicas,replica_weights))
             env['DS4_ARGODRIVE_PRIMARY_WEIGHT'] = str(primary_weight)
         state = {'verification_method':verification_method, 'status':'running', 'started_at':datetime.now(timezone.utc).isoformat(),
                  'model_sha256': DS41_Q4_SHA256, 'publication_ready':False}
@@ -227,6 +266,7 @@ def run(p, timeout=1800, replicas=(), verification_receipt=None, primary_weight=
                 (out/'baseline.map').write_text('[ds41-bench] device map: '+' '.join(k+'='+v for k,v in devices.items())+'\n')
                 sampler_log = (out/'sampler.out').open('x')
                 sampler_process = subprocess.Popen([str(sampler_binary),'100',str(timeout+5),str(out/'baseline.csv'),*devices.values()],stdout=sampler_log,stderr=subprocess.STDOUT,start_new_session=True)
+                wait_sampler_ready(sampler_process, out/'baseline.csv', out/'sampler.out', devices)
             with (out/'baseline.engine.txt').open('w') as log:
                 process = subprocess.Popen(p['argv'], cwd=Path(p['argv'][0]).parent, env=env,
                                            stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -248,6 +288,8 @@ def run(p, timeout=1800, replicas=(), verification_receipt=None, primary_weight=
                         swap_samples.append({'time':time.time(), 'used_mb':current})
                         if current - swap_samples[0]['used_mb'] > max_swap_growth_mb:
                             raise RuntimeError('Swap growth exceeded the experimental memory guard.')
+                        if expected_cache and observe_cache((out/'baseline.engine.txt').read_bytes())['allocation_reduced']:
+                            raise RuntimeError('Engine reduced the requested expert cache; this arm is not a matched comparison.')
                         if rc is not None:
                             break
             if rc:
@@ -258,6 +300,10 @@ def run(p, timeout=1800, replicas=(), verification_receipt=None, primary_weight=
             if verification_receipt:
                 check_verification_receipt(verification_receipt, model, replicas)
             raw = (out/'baseline.engine.txt').read_bytes()
+            result['runtime_cache'] = observe_cache(raw, expected_cache)
+            if expected_cache and not result['runtime_cache']['matches_requested']:
+                state['result'] = result
+                raise RuntimeError('Effective expert cache does not match the pinned profile.')
             marker = ('ds4-bench: gen[ctx='+str(p['prompt_tokens'])+'] decoded text: "').encode()
             traffic = re.findall(rb'^ds4: Argodrive source\[(\d+)\] bytes=(\d+)$', raw, re.M)
             if replicas:

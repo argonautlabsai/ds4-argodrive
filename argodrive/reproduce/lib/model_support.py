@@ -19,7 +19,7 @@ DS41_LOCAL_BENCHMARK = {
     'scope': 'One raw-completion performance prompt; 30 matched arms across lengths, plus separate held-out output checks. This does not verify your executable or files.'}
 
 
-def ds41_fork_profile(model_path, replica_paths):
+def ds41_fork_profile(model_path, replica_paths, profile='legacy'):
     """Export a reviewable configuration; this is not engine capability detection."""
     env = {
         'DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD': '1',
@@ -36,6 +36,33 @@ def ds41_fork_profile(model_path, replica_paths):
     elif replica_paths:
         env['DS4_ARGODRIVE_REPLICAS'] = ','.join(str(p)+'*1' for p in replica_paths)
         env['DS4_ARGODRIVE_PRIMARY_WEIGHT'] = '2'
+    if profile not in ('legacy', 'champion-20260919'):
+        errors.append('Unknown benchmark profile.')
+    if profile == 'champion-20260919':
+        if len(replica_paths) != 2:
+            errors.append('The 2026-09-19 champion requires two verified enclosures.')
+        env.update({
+            'DS4_ARGODRIVE_REPLICAS': ','.join(str(p)+'*5' for p in replica_paths),
+            'DS4_ARGODRIVE_PRIMARY_WEIGHT': '10',
+            'DS4_ARGODRIVE_DECODE_WEIGHTS': '10,6,6',
+            'DS4_ARGODRIVE_CPU_KEEPALIVE': '1',
+            'DS4_ARGODRIVE_GAP_KEEPALIVE': '1',
+            'DS4_TP_KEEPALIVE_TGS': '8',
+            'DS4_TP_KEEPALIVE_ITERS': '300000',
+            'DS4_ARGODRIVE_ENGRAM_ASYNC': '1',
+            'DS4_ARGODRIVE_PREFILL_SPLIT': '1',
+            'DS4_ARGODRIVE_PREFILL_SELECTIVE': '1',
+            'DS4_ARGODRIVE_PREFILL_AHEAD': '1',
+            'DS4_ARGODRIVE_PREFILL_LANES': '8',
+            'DS4_METAL_STREAMING_EXPERT_PREAD_THREADS': '9',
+        })
+        return {'id': profile, 'status': 'Pinned local champion configuration',
+                'engine_commit': '05026146efce4aedff191c052078f4d2ff040117',
+                'compiler': 'Apple clang 14.0.3 (clang-1403.0.22.14.1)',
+                'sdk': 'macOS 26.4',
+                'environment': env, 'errors': errors, 'cache_experts': 4200,
+                'primary_weight': 10, 'replica_weights': [5, 5],
+                'scope': '512 prompt / 200 generated; 18.45 steady tok/s historical median, not a guarantee.'}
     return {'id': 'ds41-argodrive-experimental', 'status': 'Experimental · local benchmark available',
             'engine': 'Argodrive ds4 fork', 'upstream_compatible': False,
             'base_commit': DS41_REVISION, 'enabled': False, 'requires_verified_replicas': True,

@@ -1,0 +1,41 @@
+{
+  "scope": "One retained pair from the historical stack qualification; not the complete four-pair dataset and not a new run. CSV timings are rounded by ds4-bench. No client-observed TTFT or physical-byte attribution is inferred.",
+  "arms": [
+    {
+      "arm": "retained-control",
+      "csv": "retained-control.csv",
+      "csv_sha256": "c0d1c70088a1b609b1ac1635b5c30155c60423d959eced1614cb8faa9e62e1a0",
+      "generated_text_sha256": "8182ab832dcc07c11d4d36028b9b3f4f5cc672538011495e60fcb4f40b91044f",
+      "runtime_cache": {
+        "requested_experts": 4200,
+        "observed_budgets": [
+          4200
+        ],
+        "allocation_reduced": false,
+        "matches_requested": true
+      },
+      "steady_tok_s": 17.77,
+      "generation_inclusive_tok_s": 17.29,
+      "prefill_tok_s": 45.42,
+      "first_decode_step_ms": 363.019
+    },
+    {
+      "arm": "retained-champion",
+      "csv": "retained-champion.csv",
+      "csv_sha256": "51657d51eb78aa30cf52722b9788a982c19ada612331f65c10c5c9b1d974217a",
+      "generated_text_sha256": "8182ab832dcc07c11d4d36028b9b3f4f5cc672538011495e60fcb4f40b91044f",
+      "runtime_cache": {
+        "requested_experts": 4200,
+        "observed_budgets": [
+          4200
+        ],
+        "allocation_reduced": false,
+        "matches_requested": true
+      },
+      "steady_tok_s": 18.46,
+      "generation_inclusive_tok_s": 17.89,
+      "prefill_tok_s": 45.35,
+      "first_decode_step_ms": 400.622
+    }
+  ]
+}

@@ -1,5 +1,7 @@
 # Argodrive DeepSeek V4.1 benchmark engine
 
+**Saved champion:** [September 19 checkpoint — exact settings, evidence and restore command](argodrive/champions/2026-09-19/README.md), tag `champion-v41-20260919`. Recorded median **18.45 steady tok/s** at pp512/tg200. Engine/shader sources are pinned; later experiments are not included.
+
 **DeepSeek V4.1 Flash (518 GB, 4-bit) streamed from SSD on a 128 GB MacBook Pro M5 Max — 512-token prompt, 200 generated, output SHA-256 identical to upstream on every arm:**
 
 | | prompt processing tok/s | steady decode tok/s |
@@ -38,8 +40,9 @@ The beta provides live drive charts and saved-run comparison. Install it, open L
 ```sh
 git clone --branch argonaut-v41-benchmark https://github.com/argonautlabsai/ds4-argodrive.git
 cd ds4-argodrive
-# Match the recorded compiler/SDK; do not rely on an older selected CLT.
-export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+# For the September 19 champion, match its recorded CLT compiler.
+# See the checkpoint above; the older September 14 matrix used Xcode.
+export DEVELOPER_DIR=/Library/Developer/CommandLineTools
 export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
 xcrun clang --version
 make -j4 CC="$(xcrun --find clang)" ds4 ds4-bench ds4-server
@@ -47,7 +50,7 @@ make -j4 CC="$(xcrun --find clang)" ds4 ds4-bench ds4-server
 
 Follow [the complete recipe](argodrive/reproduce/README.md) to verify model copies and run internal-only, one-enclosure and two-enclosure configurations. The recipe includes a pinned upstream control, physical disk sampler, output comparison and sanitizer fixtures. Model files are not included.
 
-The reader is implemented in `argodrive_read.h`: complete identical GGUF replicas, 256 KiB block splitting with weights 2:1:1, concurrent reads into disjoint buffer spans, and a completion barrier that rejects partial buffers. Scheduling changes live in `ds4.c`, `ds4_metal.m`, and `metal/moe.metal`. Engram uses eight parallel whole-row readers on the primary SSD. This branch does not implement Engram striping, a learned placement policy, or the GLM expected-completion balancer.
+The reader is implemented in `argodrive_read.h`: complete identical GGUF replicas, 256 KiB block splitting (champion: prefill 10:5:5, decode 10:6:6; legacy profile: 2:1:1), concurrent reads into disjoint buffer spans, and a completion barrier that rejects partial buffers. Scheduling changes live in `ds4.c`, `ds4_metal.m`, and `metal/moe.metal`. Engram uses eight parallel whole-row readers on the primary SSD. This branch does not implement Engram striping, a learned placement policy, or the GLM expected-completion balancer.
 
 ## Benchmark results
 

@@ -4,6 +4,8 @@ This pack targets macOS Metal on an M5 Max with 128 GiB of unified memory. It co
 
 The full model is **518,596,067,328 bytes**, SHA-256 **a5e2e2c3ada4b2e98d9f9e4b50f6d9c2a12c2c96f5da165c07e13aff9264984e**. Each enclosure needs a full, identical replica. This is application-level split reading, not RAID. Engram rows stay on the primary SSD. Keep other inference, drive calibration and model copying stopped while measuring.
 
+For the September 19 champion, use [the pinned snapshot and complete command](../champions/2026-09-19/README.md). The older build recipe below belongs to the September 14 publication matrix.
+
 ## Build two separate checkouts
 
 On the `argonaut-v41-benchmark` branch, `make -j4 ds4 ds4-bench ds4-server` builds the real reader directly. Paths below are relative to `argodrive/`. The legacy `build.py` recipe rebuilds the frozen source; for new phase accounting use this branch build.
@@ -41,6 +43,38 @@ python3 reproduce/verify.py \
 ```
 
 ## Run one arm explicitly
+
+### Pinned September 19 champion
+
+Use `--variant fork --profile champion-20260919 --prompt-tokens 512 --tokens 200`
+with the model, two verified replica paths, prompt, receipt, engine and output
+arguments shown below. This selects 4,200 cached experts, prefill weights 10:5:5,
+decode weights 10:6:6, asynchronous Engram reads, resident gate/up overlap,
+selective prefill staging, GPU gap keep-alive (8 threadgroups, 300,000 iterations)
+and one CPU keep-alive thread. The reader limit is explicitly 9; values above 18
+are clamped by this engine. Prefill pipelining is absent, matching the recorded
+qualification. Keep-alive trades additional power for lower latency.
+
+The reference engine is `05026146efce4aedff191c052078f4d2ff040117`. Its historical
+median is 18.45 **steady** tokens/s, excluding the first decode step. A new run
+still needs its own timing and output checks. This profile requires three
+physical SSDs; it must not silently substitute the older 2:1:1 settings or
+automatic cache sizing. The default `legacy` profile retains the original
+publication matrix below.
+
+The archived champion objects identify Apple clang 14.0.3; the corresponding
+Command Line Tools SDK on this host is macOS 26.4. A September 20 rebuild with
+Xcode clang 21 / SDK 27.0 changed greedy output, even with the same source and
+profile. Do not mix toolchains within a comparison or assume a rebuild matches
+the archived output. The arm records executable and shader hashes; preserve
+the compiler version and build log alongside them.
+
+The pinned profile also checks the effective expert-cache allocation. If the
+engine fails to lock 4,200 experts and reduces the cache, the harness stops the
+arm instead of accepting its timing as a matched comparison. A swap-growth
+check alone cannot detect this fallback. Raw logs remain in the arm directory.
+
+### Original publication profile
 
 `plan` prints arguments and requested settings without launching inference. `run` checks file receipts, engine/prompt/shader identities, distinct physical SSDs, another-engine exclusion and a 256 MiB swap-growth guard. It clears inherited `DS4_`, `GLM_` and `K3_` variables. Output directories must be new. The scripts never purge the OS page cache or change system power settings.
 

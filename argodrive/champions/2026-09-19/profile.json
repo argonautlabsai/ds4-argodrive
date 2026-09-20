@@ -1,0 +1,73 @@
+{
+  "id": "champion-20260919",
+  "status": "Pinned local champion configuration",
+  "engine_commit": "05026146efce4aedff191c052078f4d2ff040117",
+  "compiler": "Apple clang 14.0.3 (clang-1403.0.22.14.1)",
+  "sdk": "macOS 26.4",
+  "environment": {
+    "DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD": "1",
+    "DS4_ARGODRIVE_QUEUE_LAYERS": "1",
+    "DS4_ARGODRIVE_EARLY_EXPERTS": "1",
+    "DS4_ARGODRIVE_PRIMARY_NOCACHE": "1",
+    "DS4_ARGODRIVE_RESIDENT_GATE": "1",
+    "DS4_ARGODRIVE_ENGRAM_READERS": "8",
+    "DS4_ARGODRIVE_PHASES": "1",
+    "DS4_ARGODRIVE_REPLICAS": "<enclosure-1.gguf>*5,<enclosure-2.gguf>*5",
+    "DS4_ARGODRIVE_PRIMARY_WEIGHT": "10",
+    "DS4_ARGODRIVE_DECODE_WEIGHTS": "10,6,6",
+    "DS4_ARGODRIVE_CPU_KEEPALIVE": "1",
+    "DS4_ARGODRIVE_GAP_KEEPALIVE": "1",
+    "DS4_TP_KEEPALIVE_TGS": "8",
+    "DS4_TP_KEEPALIVE_ITERS": "300000",
+    "DS4_ARGODRIVE_ENGRAM_ASYNC": "1",
+    "DS4_ARGODRIVE_PREFILL_SPLIT": "1",
+    "DS4_ARGODRIVE_PREFILL_SELECTIVE": "1",
+    "DS4_ARGODRIVE_PREFILL_AHEAD": "1",
+    "DS4_ARGODRIVE_PREFILL_LANES": "8",
+    "DS4_METAL_STREAMING_EXPERT_PREAD_THREADS": "9"
+  },
+  "errors": [],
+  "cache_experts": 4200,
+  "primary_weight": 10,
+  "replica_weights": [
+    5,
+    5
+  ],
+  "scope": "512 prompt / 200 generated; 18.45 steady tok/s historical median, not a guarantee.",
+  "snapshot_tag": "champion-v41-20260919",
+  "hardware": {
+    "chip": "Apple M5 Max",
+    "unified_memory_gib": 128,
+    "physical_ssds": 3,
+    "enclosures": "Two Thunderbolt 5 NVMe enclosures"
+  },
+  "model": {
+    "name": "DeepSeek V4.1 Flash Q4",
+    "bytes": 518596067328,
+    "sha256": "a5e2e2c3ada4b2e98d9f9e4b50f6d9c2a12c2c96f5da165c07e13aff9264984e"
+  },
+  "prompt": {
+    "file": "speed-bench/promessi_sposi.txt",
+    "sha256": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+    "tokens": 512
+  },
+  "generated_tokens": 200,
+  "context_allocation": 4096,
+  "engram_source": "primary SSD; asynchronous whole-row readers",
+  "speculative_decode": false,
+  "historical_result": {
+    "steady_tok_s_median": 18.45,
+    "prefill_tok_s_median": 45.34,
+    "comparison_control_steady_tok_s_median": 17.84,
+    "matched_pairs": 4,
+    "pair_gains_tok_s": [
+      0.53,
+      0.56,
+      0.62,
+      0.69
+    ],
+    "generation_inclusive_tok_s_median": null,
+    "source": "README at engine_commit; aggregate retained as recorded, not recomputed from eight archived arms"
+  },
+  "qualification_scope": "Historical same-prompt performance and byte-identical output; not a broad model-quality evaluation or a portable speed guarantee. September 20 candidates are excluded."
+}
