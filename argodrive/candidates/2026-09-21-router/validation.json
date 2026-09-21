@@ -1,0 +1,41 @@
+{
+  "engine_source_commit": "a53dab7bdd435b41974371a393e7eb883fa9774b",
+  "profile_commit": "c4ca599",
+  "build": "CLI, benchmark, server: PASS with Apple clang 14.0.3 / macOS 26.4 SDK",
+  "python_tests": 27,
+  "focused_fixtures": [
+    "flat_pool",
+    "q4_resident_down",
+    "q8_round_epilogue",
+    "shared_bf16",
+    "norm_bf16",
+    "hc_norm",
+    "live_scan",
+    "decay",
+    "keepalive_scope",
+    "hc_expand",
+    "qakv",
+    "rope_input"
+  ],
+  "router_fixture": {
+    "modes": 4,
+    "cases_per_mode": 84,
+    "buffer_view_offsets_bytes": [
+      0,
+      64
+    ],
+    "bit_exact": true,
+    "metal_api_validation": true
+  },
+  "core_metal": [
+    "DeepSeek V4.1 fixture",
+    "command-memory stress fixture"
+  ],
+  "cpu_backend": "CPU-only compilation, linking and help passed; no model inference",
+  "not_exercised": [
+    "Broad model-quality suite",
+    "CUDA hardware",
+    "Distributed inference hardware",
+    "AddressSanitizer on this candidate"
+  ]
+}

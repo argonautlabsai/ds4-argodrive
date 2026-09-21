@@ -4,6 +4,10 @@
 with a V4.1 router fast path and a small fusion stack. Select it explicitly;
 the existing profiles and engine defaults are unchanged.
 
+The [matched results and all attempts](../candidates/2026-09-21-router/README.md)
+record 20.105 steady / 19.445 inclusive tok/s at pp512/tg200. The longer repeat
+has not qualified because GPU clocks varied between arms.
+
 The engine source revision is `a53dab7bdd435b41974371a393e7eb883fa9774b`.
 The profile adds exactly these settings:
 
