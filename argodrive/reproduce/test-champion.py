@@ -22,7 +22,7 @@ def main():
     env['MTL_DEBUG_LAYER']='1'
     fixtures=['flat_pool','q4_resident_down','q8_round_epilogue','shared_bf16',
               'norm_bf16','hc_norm','live_scan','decay','keepalive_scope',
-              'hc_expand','qakv','rope_input']
+              'hc_expand','qakv','rope_input','v41_router']
     with Path('/tmp/argodrive-glm-campaign.lock').open('a+') as lock, tempfile.TemporaryDirectory(prefix='argodrive-champion-tests-') as tmp:
         fcntl.flock(lock, fcntl.LOCK_EX|fcntl.LOCK_NB);process_guard()
         for name in fixtures:
@@ -32,11 +32,12 @@ def main():
                             '-framework','Foundation','-framework','Metal','-lm','-pthread',
                             '-o',str(binary)],check=True,cwd=root,timeout=120)
             cases=[[]]
+            if name=='v41_router': cases=[[],['offset']]
             if name=='keepalive_scope': cases=[['1'],['2']]
             if name=='decay': cases=[[v,v if v.isdigit() and v!='0' else '16'] for v in ('4','8','16','32','64','128','0','invalid')]
             for case in cases:
                 subprocess.run([str(binary),*case],check=True,cwd=root,env=env,timeout=90)
             print('PASS',name,flush=True)
-    print('PASS: twelve focused fixtures; no full-model, CUDA or distributed inference claim.')
+    print('PASS: thirteen focused fixtures; no full-model, CUDA or distributed inference claim.')
 
 if __name__=='__main__': main()

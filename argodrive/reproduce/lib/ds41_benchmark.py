@@ -208,7 +208,7 @@ def run(p, timeout=1800, replicas=(), verification_receipt=None, primary_weight=
                     'DS4_ARGODRIVE_LIVE_SCAN', 'DS4_ARGODRIVE_DECAY_TOKENS',
                     'DS4_ARGODRIVE_HC_EXPAND_BF16', 'DS4_ARGODRIVE_ROPE_INPUT',
                     'DS4_ARGODRIVE_QAKV_BF16', 'DS4_ARGODRIVE_Q8_ROWS_EPILOGUE',
-                    'DS4_ARGODRIVE_VIEW_CACHE'})
+                    'DS4_ARGODRIVE_VIEW_CACHE', 'DS4_ARGODRIVE_V41_ROUTER_FUSION'})
     if any(k not in allowed or not isinstance(v, str) or '\0' in v
            for k, v in experimental_env.items()):
         raise ValueError('Unsupported experimental environment setting.')

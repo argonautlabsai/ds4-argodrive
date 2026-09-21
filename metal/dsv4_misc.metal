@@ -7084,3 +7084,124 @@ kernel void kernel_dsv4_softmax_pool_ratio4_direct(
 
     dst[ic * args.head_dim + id] = acc/sum;
 }
+
+// V4.1's 384-expert, six-selection decode router. Keep the reference's
+// 512-wide bitonic comparison network, including its tie and padding rules.
+kernel void kernel_argodrive_v41_router_select(
+        constant uint &has_bias, device const float4 *logits,
+        device const float *bias, device float *probs, device int *selected,
+        threadgroup char *scratch [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup int *idx=(threadgroup int *)scratch;
+    threadgroup float *scores=(threadgroup float *)(scratch+512*sizeof(int));
+    if(tid<96) {
+        float4 x=logits[tid];
+        // Materialize the same F32 boundary as the standalone softplus kernel.
+        device volatile float4 *p=(device volatile float4 *)probs;
+        p[tid]=select(log(1.0f+exp(x)),x,x>20.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    if(tid<96) {
+        device volatile float4 *p=(device volatile float4 *)probs;
+        float4 sp=p[tid];p[tid]=sqrt(sp);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    idx[tid]=(int)tid;
+    if(tid<384) {
+        device volatile const float *p=probs;
+        scores[tid]=has_bias ? p[tid]+bias[tid] : p[tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint k=2;k<=512;k<<=1) {
+        for(uint j=k>>1;j;j>>=1) {
+            uint other=tid^j;
+            if(other>tid) {
+                int a=idx[tid],b=idx[other];
+                bool exchange=(tid&k)==0 ?
+                    (a>=384 || (b<384 && scores[a]<scores[b])) :
+                    (b>=384 || (a<384 && scores[a]>scores[b]));
+                if(exchange){idx[tid]=b;idx[other]=a;}
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    if(tid<6)selected[tid]=idx[tid];
+}
+
+// Six threads, exactly like the reference sum_rows dispatch. Preserve both
+// SIMD sums, denominator clamp, division store and subsequent scale multiply.
+kernel void kernel_argodrive_v41_router_weights(
+        constant float &scale, device const float *probs,
+        device const int *selected, device float *weights,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    scratch[tid]=0.0f;
+    float sumf=0.0f;sumf+=probs[selected[tid]];
+    sumf=simd_sum(sumf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(tid==0)scratch[0]=sumf;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf=simd_sum(scratch[tid]);
+    threadgroup volatile float *v=scratch;
+    if(tid==0)v[32]=sumf;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(tid==0)v[33]=clamp(v[32],6.103515625e-5f,INFINITY);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device volatile float *w=weights;
+    w[tid]=probs[selected[tid]]/v[33];
+    threadgroup_barrier(mem_flags::mem_device);
+    float divided=w[tid];w[tid]=divided*scale;
+}
+
+// V4.1's 384-expert, six-selection decode router. Keep the reference's
+// 512-wide bitonic comparison network, including its tie and padding rules.
+kernel void kernel_argodrive_v41_router_select_simd(
+        constant uint &has_bias, device const float4 *logits,
+        device const float *bias, device float *probs, device int *selected,
+        threadgroup char *scratch [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup int *idx=(threadgroup int *)scratch;
+    threadgroup float *scores=(threadgroup float *)(scratch+512*sizeof(int));
+    if(tid<96) {
+        float4 x=logits[tid];
+        // Materialize the same F32 boundary as the standalone softplus kernel.
+        device volatile float4 *p=(device volatile float4 *)probs;
+        p[tid]=select(log(1.0f+exp(x)),x,x>20.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    if(tid<96) {
+        device volatile float4 *p=(device volatile float4 *)probs;
+        float4 sp=p[tid];p[tid]=sqrt(sp);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    idx[tid]=(int)tid;
+    if(tid<384) {
+        device volatile const float *p=probs;
+        scores[tid]=has_bias ? p[tid]+bias[tid] : p[tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int reg_idx=(int)tid;
+    float value=tid<384 ? scores[tid] : 0.0f;
+    threadgroup int *banks_i=(threadgroup int *)scratch;
+    threadgroup float *banks_v=(threadgroup float *)(scratch+1024*sizeof(int));
+    uint cross=0;
+    for(uint k=2;k<=512;k<<=1) {
+        for(uint j=k>>1;j;j>>=1) {
+            int peer;float pv;
+            if(j<32) {
+                peer=simd_shuffle_xor(reg_idx,(ushort)j);
+                pv=simd_shuffle_xor(value,(ushort)j);
+            } else {
+                uint bank=(cross&1u)*512u;
+                banks_i[bank+tid]=reg_idx;banks_v[bank+tid]=value;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                peer=banks_i[bank+(tid^j)];pv=banks_v[bank+(tid^j)];cross++;
+            }
+            bool first=((tid&k)==0)==((tid&j)==0);
+            bool exchange=first ? (reg_idx>=384 || (peer<384 && value<pv)) :
+                                  (peer>=384 || (reg_idx<384 && value>pv));
+            if(exchange){reg_idx=peer;value=pv;}
+        }
+    }
+    if(tid<6)selected[tid]=reg_idx;
+}

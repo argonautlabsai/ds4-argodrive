@@ -34748,6 +34748,19 @@ static int ds4_gpu_encode_sum_rows_f32(
     return 1;
 }
 
+static int ar_v41_router_weights(id<MTLCommandBuffer> cb,
+        id<MTLBuffer> probs, NSUInteger po, id<MTLBuffer> selected, NSUInteger so,
+        id<MTLBuffer> weights, NSUInteger wo, float scale) {
+    id<MTLComputePipelineState> ps=ds4_gpu_get_pipeline("kernel_argodrive_v41_router_weights");
+    if(!ps)return 0;
+    id<MTLComputeCommandEncoder> enc=ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:ps];[enc setBytes:&scale length:sizeof(scale) atIndex:0];
+    [enc setBuffer:probs offset:po atIndex:1];[enc setBuffer:selected offset:so atIndex:2];
+    [enc setBuffer:weights offset:wo atIndex:3];[enc setThreadgroupMemoryLength:40*sizeof(float) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(6,1,1)];
+    ds4_gpu_end_compute_encoder(cb,enc);return 1;
+}
+
 static int ds4_gpu_encode_router_select(
         id<MTLCommandBuffer>  cb,
         ds4_gpu_tensor     *selected,
@@ -34789,6 +34802,30 @@ static int ds4_gpu_encode_router_select(
         n_expert == 256u &&
         n_expert_used == 6u &&
         fabsf(expert_weight_scale - 1.5f) <= 1.0e-6f;
+
+    const char *ar_router=getenv("DS4_ARGODRIVE_V41_ROUTER_FUSION");
+    const int ar_mode=ar_router && !strcmp(ar_router,"1") ? 1 :
+                      ar_router && !strcmp(ar_router,"2") ? 2 :
+                      ar_router && !strcmp(ar_router,"3") ? 3 :
+                      ar_router && !strcmp(ar_router,"4") ? 4 : 0;
+    const bool ar_v41=ar_mode && !g_quality_mode && !mixed_visual && !hash_mode &&
+                      n_tokens==1 && n_expert==384 && n_expert_used==6;
+    if(ar_v41 && ar_mode>=3) {
+        id<MTLComputePipelineState> ps=ds4_gpu_get_pipeline(ar_mode==4 ? "kernel_argodrive_v41_router_select_simd" : "kernel_argodrive_v41_router_select");
+        if(!ps || ps.maxTotalThreadsPerThreadgroup<512)return 0;
+        const uint32_t bias=has_bias ? 1u : 0u;const float zero=0;
+        id<MTLComputeCommandEncoder> enc=ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:ps];[enc setBytes:&bias length:sizeof(bias) atIndex:0];
+        [enc setBuffer:logitsbuf offset:logits_off atIndex:1];
+        if(has_bias)[enc setBuffer:biasbuf offset:bias_off atIndex:2];
+        else [enc setBytes:&zero length:sizeof(zero) atIndex:2];
+        [enc setBuffer:probsbuf offset:probs_off atIndex:3];
+        [enc setBuffer:selectedbuf offset:selected_off atIndex:4];
+        [enc setThreadgroupMemoryLength:(ar_mode==4 ? 1024 : 512)*(sizeof(float)+sizeof(int32_t)) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(512,1,1)];
+        ds4_gpu_end_compute_encoder(cb,enc);
+        return ar_v41_router_weights(cb,probsbuf,probs_off,selectedbuf,selected_off,weightsbuf,weights_off,expert_weight_scale);
+    }
 
     int ok = 0;
     if (flash_router_fast_path && !mixed_visual &&
@@ -34950,7 +34987,7 @@ static int ds4_gpu_encode_router_select(
         return 1;
     }
 
-    if (flash_router_fast_path && !mixed_visual && !g_quality_mode && n_tokens == 1) {
+    if ((flash_router_fast_path || (ar_v41 && ar_mode>=2)) && !mixed_visual && !g_quality_mode && n_tokens == 1) {
         id<MTLComputePipelineState> softplus_sqrt_pipeline =
             ds4_gpu_hot_pipeline(g_dsv4_softplus_sqrt_pipeline,
                                     "kernel_dsv4_softplus_sqrt_f32_4");
@@ -35069,6 +35106,8 @@ static int ds4_gpu_encode_router_select(
         ok = ds4_gpu_indexer_topk_tensor(selected, score_tensor, n_expert, n_tokens, n_expert_used) != 0;
     }
     if (!ok) return 0;
+
+    if(ar_v41) return ar_v41_router_weights(cb,probsbuf,probs_off,selectedbuf,selected_off,weightsbuf,weights_off,expert_weight_scale);
 
     const bool use_batch_weights_fusion =
         flash_router_fast_path && !g_quality_mode && n_tokens > 1u &&
