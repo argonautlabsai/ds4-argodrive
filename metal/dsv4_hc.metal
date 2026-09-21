@@ -649,7 +649,13 @@ kernel void kernel_dsv4_hc_expand(
 // HC=4 specialization of the post/expand step. One thread computes all four
 // destination HC streams for one token/dimension, reusing the same block output
 // and residual HC values while preserving the per-stream accumulation order.
-kernel void kernel_dsv4_hc_expand4(
+inline float ar_hc_expand_bf16(float v) {
+    uint bits=as_type<uint>(v);
+    if (isfinite(v)) bits=(bits+0x7fffu+((bits>>16)&1u))&0xffff0000u;
+    return as_type<float>(bits);
+}
+template<bool ROUND_BF16>
+void ar_hc_expand4_impl(
         constant ds4_metal_args_dsv4_hc_expand & args,
         device  const char * block_out,
         device  const char * residual,
@@ -657,7 +663,7 @@ kernel void kernel_dsv4_hc_expand4(
         device  const char * comb,
         device  const char * block_add,
         device        char * dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint gid ) {
     if (args.n_hc != 4) {
         return;
     }
@@ -688,9 +694,29 @@ kernel void kernel_dsv4_hc_expand4(
         acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 2*args.nb_comb1 + t*args.nb_comb2)) * r2;
         acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 3*args.nb_comb1 + t*args.nb_comb2)) * r3;
 
-        *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) = acc;
+        *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) = ROUND_BF16 ? ar_hc_expand_bf16(acc) : acc;
     }
 }
+
+kernel void kernel_dsv4_hc_expand4(
+        constant ds4_metal_args_dsv4_hc_expand & args,
+        device  const char * block_out,
+        device  const char * residual,
+        device  const char * post,
+        device  const char * comb,
+        device  const char * block_add,
+        device        char * dst,
+        uint gid [[thread_position_in_grid]]) { ar_hc_expand4_impl<false>(args, block_out, residual, post, comb, block_add, dst, gid); }
+
+kernel void kernel_dsv41_hc_expand_bf16(
+        constant ds4_metal_args_dsv4_hc_expand & args,
+        device  const char * block_out,
+        device  const char * residual,
+        device  const char * post,
+        device  const char * comb,
+        device  const char * block_add,
+        device        char * dst,
+        uint gid [[thread_position_in_grid]]) { ar_hc_expand4_impl<true>(args, block_out, residual, post, comb, block_add, dst, gid); }
 
 // Decode-time FFN tail fusion:
 //

@@ -46761,18 +46761,18 @@ int ds4_gpu_hc_expand_add_tensor(
     return 1;
 }
 
-int ds4_gpu_hc_expand_split_tensor(
+static int ar_hc_expand_split(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
-        uint32_t                n_hc) {
+        uint32_t                n_hc, bool round_bf16) {
     if (!g_initialized && !ds4_gpu_init()) {
         fprintf(stderr, "ds4: Metal HC expand split could not initialize the backend\n");
         return 0;
     }
-    if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0) {
+    if (!out_hc || !block_out || !residual_hc || !split || n_embd == 0 || n_hc == 0 || (round_bf16 && n_hc != 4)) {
         fprintf(stderr, "ds4: Metal HC expand split received invalid arguments\n");
         return 0;
     }
@@ -46843,8 +46843,8 @@ int ds4_gpu_hc_expand_split_tensor(
         id<MTLComputePipelineState> expand_pipeline = g_hc_expand_pipeline;
         uint64_t n_elem = (uint64_t)n_embd * n_hc * n_tokens64;
         if (n_hc == 4) {
-            expand_pipeline = ds4_gpu_hot_pipeline(g_dsv4_hc_expand4_pipeline,
-                                                      "kernel_dsv4_hc_expand4");
+            expand_pipeline = round_bf16 ? ds4_gpu_get_pipeline("kernel_dsv41_hc_expand_bf16") :
+                ds4_gpu_hot_pipeline(g_dsv4_hc_expand4_pipeline, "kernel_dsv4_hc_expand4");
             n_elem = (uint64_t)n_embd * n_tokens64;
         }
         if (!expand_pipeline) {
@@ -46878,6 +46878,22 @@ int ds4_gpu_hc_expand_split_tensor(
 
     return 1;
 }
+
+int ds4_gpu_hc_expand_split_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) { return ar_hc_expand_split(out_hc, block_out, residual_hc, split, n_embd, n_hc, false); }
+
+int ds4_gpu_dsv41_hc_expand_bf16(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) { return ar_hc_expand_split(out_hc, block_out, residual_hc, split, n_embd, n_hc, true); }
 
 int ds4_gpu_hc_expand_split_half_tensor(
         ds4_gpu_tensor       *out_hc,

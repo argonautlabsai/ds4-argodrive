@@ -3136,6 +3136,16 @@ int ds4_gpu_hc_expand_add_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+#if defined(__APPLE__)
+int ds4_gpu_dsv41_hc_expand_bf16(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+#endif
+
 int ds4_gpu_hc_expand_split_tensor(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out,

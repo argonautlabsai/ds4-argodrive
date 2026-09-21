@@ -39708,10 +39708,12 @@ static bool ds41_attention_select(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_attention_heads_rope(ds41_gpu_graph *g, uint32_t il, uint32_t heads) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
     const char *fuse = getenv("DS4_ARGODRIVE_ROPE_INPUT");
     if (g->streaming && g->tp_world == 1 && !g->quality && !g->imatrix && fuse && strcmp(fuse, "0"))
         return ds4_gpu_dsv41_rope_bf16_input(g->heads, DS4_N_HEAD_DIM, heads, 1, g->pos,
                                             ds4_layer_compress_ratio(il) != 0, true);
+#endif
     return ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) &&
            ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, g->pos, true);
 }
@@ -40030,10 +40032,21 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
         ds41_hc_sum_norm(g, m, l->attn_norm, g->residual, g->pre, false);
 }
 
+static bool ds41_hc_expand(ds41_gpu_graph *g, ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    const char *fuse=getenv("DS4_ARGODRIVE_HC_EXPAND_BF16");
+    if (g->streaming && g->tp_world==1 && !g->quality && !g->imatrix &&
+        fuse && strcmp(fuse,"0"))
+        return ds4_gpu_dsv41_hc_expand_bf16(out,g->block,residual,split,DS4_N_EMBD,DS4_N_HC);
+#endif
+    return ds4_gpu_hc_expand_split_tensor(out,g->block,residual,split,DS4_N_EMBD,DS4_N_HC) &&
+        ds41_bf16(out,DS4_N_EMBD*DS4_N_HC);
+}
+
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
                                       const ds4_layer_weights *l) {
-    return ds4_gpu_hc_expand_split_tensor(g->after_attn, g->block, g->residual, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->after_attn, DS4_N_EMBD * DS4_N_HC) &&
+    return ds41_hc_expand(g,g->after_attn,g->residual,g->attn_split) &&
         ds41_hc_mix(g, m, l, true) &&
         ds41_hc_sum_norm(g, m, l->ffn_norm, g->after_attn, g->attn_split, true);
 }
@@ -40309,8 +40322,7 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
-    return ds4_gpu_hc_expand_split_tensor(g->residual, g->block, g->after_attn, g->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->residual, DS4_N_EMBD * DS4_N_HC) &&
+    return ds41_hc_expand(g,g->residual,g->after_attn,g->ffn_split) &&
         ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
 }
 

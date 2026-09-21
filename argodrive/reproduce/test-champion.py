@@ -21,7 +21,8 @@ def main():
     env={k:v for k,v in os.environ.items() if not k.startswith(('DS4_','GLM_','K3_'))}
     env['MTL_DEBUG_LAYER']='1'
     fixtures=['flat_pool','q4_resident_down','q8_round_epilogue','shared_bf16',
-              'norm_bf16','hc_norm','live_scan','decay','keepalive_scope']
+              'norm_bf16','hc_norm','live_scan','decay','keepalive_scope',
+              'hc_expand','qakv','rope_input']
     with Path('/tmp/argodrive-glm-campaign.lock').open('a+') as lock, tempfile.TemporaryDirectory(prefix='argodrive-champion-tests-') as tmp:
         fcntl.flock(lock, fcntl.LOCK_EX|fcntl.LOCK_NB);process_guard()
         for name in fixtures:
@@ -36,6 +37,6 @@ def main():
             for case in cases:
                 subprocess.run([str(binary),*case],check=True,cwd=root,env=env,timeout=90)
             print('PASS',name,flush=True)
-    print('PASS: nine focused fixtures; no full-model, CUDA or distributed inference claim.')
+    print('PASS: twelve focused fixtures; no full-model, CUDA or distributed inference claim.')
 
 if __name__=='__main__': main()
