@@ -1,0 +1,43 @@
+{
+  "date": "2026-09-21",
+  "engine_source_commit": "cc4907be46af6cb6faa6f3c794a65bf816ecf7d5",
+  "build": "PASS: ds4, ds4-bench and ds4-server with Apple clang 14.0.3 / macOS 26.4 SDK",
+  "python_tests": {
+    "passed": 25
+  },
+  "focused_fixtures": {
+    "passed": [
+      "flat_pool",
+      "q4_resident_down",
+      "q8_round_epilogue",
+      "shared_bf16",
+      "norm_bf16",
+      "hc_norm",
+      "live_scan",
+      "decay",
+      "keepalive_scope"
+    ],
+    "metal_api_validation": true
+  },
+  "core_metal": "PASS: DeepSeek V4.1, streamed experts (default/Q4/MXFP4) and command memory (default/row/session/batch/big)",
+  "cpu_backend": "PASS: CPU-only compilation, linking and --help; no model inference",
+  "readers": "PASS: UBSan reader/Engram fixtures",
+  "address_sanitizer": "Not exercised: runtime initialization aborted before fixture main (sanitizer_malloc_mac.inc:189)",
+  "not_exercised": [
+    "Full upstream model-dependent suite",
+    "CUDA hardware",
+    "Distributed inference hardware",
+    "Broad model-quality benchmark"
+  ],
+  "publication_cli_smoke": {
+    "profile": "champion-20260921",
+    "prompt_tokens": 512,
+    "generated_tokens": 200,
+    "engine_sha256": "dcbad936b8dddf0b215173c13c8806d5c76c69f60888eb1b69ff32ec2dad0e1a",
+    "output_sha256": "8182ab832dcc07c11d4d36028b9b3f4f5cc672538011495e60fcb4f40b91044f",
+    "cache_experts": 4200,
+    "swap_growth_mb": 0.0,
+    "positive_expert_bytes_on_all_three_sources": true,
+    "scope": "Fresh release-checkout build through public run.py command. A functionality/output check, excluded from eight-arm speed medians."
+  }
+}

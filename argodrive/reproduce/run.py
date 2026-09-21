@@ -40,13 +40,14 @@ def main():
     for name in ('engine', 'model', 'prompt', 'out'):
         a.add_argument('--'+name, required=True, type=Path)
     a.add_argument('--variant', choices=['upstream', 'fork'], required=True)
-    a.add_argument('--profile', choices=['legacy', 'champion-20260919'], default='legacy')
+    a.add_argument('--profile', choices=['legacy', 'champion-20260919', 'champion-20260921'], default='legacy')
     a.add_argument('--replica', action='append', default=[], type=Path)
     a.add_argument('--receipt', type=Path)
     a.add_argument('--prompt-tokens', choices=[512, 2048], type=int, default=512)
     a.add_argument('--tokens', choices=[60, 128, 200, 512], type=int, default=512)
     a.add_argument('--sampler', type=Path)
     a.add_argument('--accounting', action='store_true', help='Capture phase-boundary expert and Engram application bytes')
+    a.add_argument('--timeline', action='store_true', help='Write the bounded engine timeline inside the new arm folder')
     a.add_argument('--timeout', type=int, default=1800)
     args = a.parse_args()
     if len(args.replica)>2 or (args.replica and args.variant=='upstream'):
@@ -60,6 +61,9 @@ def main():
     if args.accounting:
         if args.variant != 'fork': a.error('Accounting requires this fork build.')
         env['DS4_ARGODRIVE_ACCOUNTING'] = '1'
+    if args.timeline:
+        if args.variant != 'fork': a.error('Timeline requires this fork build.')
+        env['DS4_ARGODRIVE_TIMELINE'] = str(args.out.resolve()/'timeline.csv')
     # Harness validates and sets the actual replica paths after receipt checks.
     env = {k:v for k,v in env.items() if k not in ('DS4_ARGODRIVE_REPLICAS','DS4_ARGODRIVE_PRIMARY_WEIGHT')}
     p = plan(args.engine,args.model,args.prompt,args.out,args.prompt_tokens,args.tokens)

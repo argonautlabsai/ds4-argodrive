@@ -21,6 +21,24 @@ DS41_LOCAL_BENCHMARK = {
 
 def ds41_fork_profile(model_path, replica_paths, profile='legacy'):
     """Export a reviewable configuration; this is not engine capability detection."""
+    if profile == 'champion-20260921':
+        previous = ds41_fork_profile(model_path, replica_paths, 'champion-20260919')
+        previous['environment'].update({
+            'DS4_ARGODRIVE_RESIDENT_DOWN': '1',
+            'DS4_ARGODRIVE_Q8_ROUND_EPILOGUE': '1',
+            'DS4_ARGODRIVE_GAP_KEEPALIVE': '2',
+            'DS4_ARGODRIVE_FLAT_READS': '1',
+            'DS4_ARGODRIVE_SHARED_BF16': '1',
+            'DS4_ARGODRIVE_NORM_BF16': '1',
+            'DS4_ARGODRIVE_HC_NORM': '1',
+            'DS4_TP_KEEPALIVE_TGS': '1',
+            'DS4_ARGODRIVE_LIVE_SCAN': '1',
+            'DS4_ARGODRIVE_DECAY_TOKENS': '32',
+        })
+        return {**previous, 'id': profile,
+                'engine_commit': 'cc4907be46af6cb6faa6f3c794a65bf816ecf7d5',
+                'errors': ['The champion requires two verified enclosures.'] if len(replica_paths) != 2 else previous['errors'],
+                'scope': '512 prompt; 200/512 generated; 19.58/19.905 steady tok/s matched medians on the recorded Mac.'}
     env = {
         'DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD': '1',
         'DS4_ARGODRIVE_QUEUE_LAYERS': '1',

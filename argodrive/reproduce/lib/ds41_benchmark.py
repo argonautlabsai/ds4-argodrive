@@ -203,6 +203,9 @@ def run(p, timeout=1800, replicas=(), verification_receipt=None, primary_weight=
                'DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD',
                'DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY',
                'DS4_ARGODRIVE_DECODE_WEIGHTS', 'DS4_ARGODRIVE_CPU_KEEPALIVE', 'DS4_ARGODRIVE_GAP_KEEPALIVE', 'DS4_TP_KEEPALIVE_TGS', 'DS4_TP_KEEPALIVE_ITERS', 'DS4_ARGODRIVE_ENGRAM_ASYNC', 'DS4_ARGODRIVE_PREFILL_SPLIT', 'DS4_ARGODRIVE_PREFILL_SELECTIVE', 'DS4_ARGODRIVE_PREFILL_AHEAD', 'DS4_ARGODRIVE_PREFILL_LANES'}
+    allowed.update({'DS4_ARGODRIVE_RESIDENT_DOWN', 'DS4_ARGODRIVE_Q8_ROUND_EPILOGUE',
+                    'DS4_ARGODRIVE_SHARED_BF16', 'DS4_ARGODRIVE_HC_NORM',
+                    'DS4_ARGODRIVE_LIVE_SCAN', 'DS4_ARGODRIVE_DECAY_TOKENS'})
     if any(k not in allowed or not isinstance(v, str) or '\0' in v
            for k, v in experimental_env.items()):
         raise ValueError('Unsupported experimental environment setting.')

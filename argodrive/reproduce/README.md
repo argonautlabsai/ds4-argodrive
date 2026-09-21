@@ -6,6 +6,10 @@ The full model is **518,596,067,328 bytes**, SHA-256 **a5e2e2c3ada4b2e98d9f9e4b5
 
 For the September 19 champion, use [the pinned snapshot and complete command](../champions/2026-09-19/README.md). The older build recipe below belongs to the September 14 publication matrix.
 
+## Latest September 21 champion
+
+Use `--profile champion-20260921` for the published 19.58 / 19.905 steady tok/s configuration at pp512/tg200 and pp512/tg512. Follow [the complete recipe and eight-arm results](../champions/2026-09-21/README.md), including `--accounting --timeline` for matching measurement settings. The named September 19 and legacy profiles remain available. The build instructions below describe the older publication matrix.
+
 ## Build two separate checkouts
 
 On the `argonaut-v41-benchmark` branch, `make -j4 ds4 ds4-bench ds4-server` builds the real reader directly. Paths below are relative to `argodrive/`. The legacy `build.py` recipe rebuilds the frozen source; for new phase accounting use this branch build.

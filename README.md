@@ -1,4 +1,42 @@
-# Argodrive DeepSeek V4.1 benchmark engine
+# DS4 Argodrive — DeepSeek V4.1 on three SSDs
+
+**19.58 steady tok/s at 200 generated tokens; 19.90–19.91 at 512.** DeepSeek V4.1 Flash Q4 (518.6 GB), M5 Max with 128 GiB, internal SSD plus two Thunderbolt 5 NVMe enclosures. Every run used the same 512-token prompt.
+
+![Measured steady and inclusive decode speeds](argodrive/champions/2026-09-21/comparison.svg)
+
+| Generated tokens | Previous champion, steady median | New champion, steady median | Gain | New champion, inclusive median |
+|---|---:|---:|---:|---:|
+| 200 | 18.405 | **19.580** | **+6.38%** | **19.030** |
+| 512 | 18.790 | **19.905** | **+5.93%** | **19.670** |
+
+Eight interleaved runs, two per configuration and length: matching reference outputs, full 4,200-expert cache, zero swap growth and stable measured GPU clocks. Steady excludes the first decode step; inclusive includes it. Both exclude startup and prefill. This campaign compares the new code with our previous champion; upstream ds4 was not rerun.
+
+[**Release and source snapshot**](https://github.com/argonautlabsai/ds4-argodrive/releases/tag/champion-v41-20260921) · [**Reproduce it**](argodrive/champions/2026-09-21/README.md#build-and-reproduce) · [**All eight CSVs and validation**](argodrive/champions/2026-09-21/README.md#evidence-and-limits) · [**Machine-readable results**](argodrive/champions/2026-09-21/results.json)
+
+This experimental fork builds on [ds4 by Salvatore Sanfilippo (antirez) and contributors](https://github.com/antirez/ds4). The reader, scheduling changes and Metal kernels are included in this repository; no private provider is required. Original licences, acknowledgements and [credits](CREDITS.md) are preserved. Development and review used Claude, ChatGPT and OpenAI Codex.
+
+Select the explicit `champion-20260921` profile. It combines resident-expert compute overlap, persistent split-read dispatch, rounding-preserving kernel fusions, cache scanning and tuned keepalive. Prefill reads split **10:5:5**, decode **10:6:6**; Engram stays asynchronous on the primary SSD. Keepalive consumes additional power and can lose performance under competing GPU work. This one-prompt experiment is not broad model-quality validation or a universal speed guarantee.
+
+## Build and test
+
+```sh
+git clone --branch champion-v41-20260921 https://github.com/argonautlabsai/ds4-argodrive.git
+cd ds4-argodrive
+export DEVELOPER_DIR=/Library/Developer/CommandLineTools
+export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+xcrun clang --version
+make -j4 CC="$(xcrun --find clang)" ds4 ds4-bench ds4-server
+python3 argodrive/champions/2026-09-21/verify-results.py
+```
+
+The measured toolchain was Apple clang 14.0.3 / macOS 26.4 SDK. Verify your installed versions and follow the [full run command](argodrive/champions/2026-09-21/README.md#build-and-reproduce) with three verified model copies. Model files are separate. The [validation section](argodrive/champions/2026-09-21/README.md#validation) records passed checks and the ASan runtime-startup limitation.
+
+## Inspect your storage with Argodrive
+
+[**Argodrive app and downloads**](https://github.com/argonautlabsai/argodrive) provides live drive charts and saved-run comparison. Use it to inspect storage behavior and compare your measurements; this engine's benchmark recipe is above. Report feedback in the [Argodrive issue tracker](https://github.com/argonautlabsai/argodrive/issues).
+
+<details>
+<summary>Earlier benchmark campaigns and reproduction records</summary>
 
 **Saved champion:** [September 19 checkpoint — exact settings, evidence and restore command](argodrive/champions/2026-09-19/README.md), tag `champion-v41-20260919`. Recorded median **18.45 steady tok/s** at pp512/tg200. Engine/shader sources are pinned; later experiments are not included.
 
@@ -70,6 +108,8 @@ Measured on an **M5 Max, 128 GiB, DeepSeek V4.1 Flash Q4**, using the same **512
 [**Test details and reproduction**](argodrive/results/FINAL-MATCHED-2026-09-14.md) · [**Measured data**](argodrive/results/final-matched-2026-09-14.json) · [Chart source](argodrive/results/charts/generate-final.py)
 
 ---
+
+</details>
 
 ## Upstream ds4 documentation (preserved)
 

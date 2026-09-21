@@ -1,0 +1,1167 @@
+{
+  "schema": 1,
+  "date": "2026-09-21",
+  "hardware": {
+    "chip": "Apple M5 Max",
+    "unified_memory_gib": 128,
+    "physical_ssds": 3,
+    "enclosures": "Two Thunderbolt 5 NVMe enclosures"
+  },
+  "model": {
+    "name": "DeepSeek V4.1 Flash Q4",
+    "file_bytes": 518596067328,
+    "sha256": "a5e2e2c3ada4b2e98d9f9e4b50f6d9c2a12c2c96f5da165c07e13aff9264984e"
+  },
+  "prompt": {
+    "file": "speed-bench/promessi_sposi.txt",
+    "sha256": "f53e0d80cb2d4492d24ebd63c7000c397b16ae70f9bf09b3763e5d8323ec209f",
+    "tokens": 512,
+    "context_allocation": 4096
+  },
+  "protocol": {
+    "generation_lengths": [
+      200,
+      512
+    ],
+    "order": {
+      "200": "ABBA",
+      "512": "BAAB"
+    },
+    "A": "September 19 champion",
+    "B": "September 21 champion",
+    "repeats_per_configuration_per_length": 2,
+    "expert_cache_entries": 4200,
+    "prefill_weights": [
+      10,
+      5,
+      5
+    ],
+    "decode_weights": [
+      10,
+      6,
+      6
+    ],
+    "engram_source": "Primary SSD, eight asynchronous whole-row readers",
+    "measurement_enabled": [
+      "100 ms physical SSD sampler",
+      "engine phase accounting",
+      "bounded engine timeline",
+      "existing GPU/CPU powermetrics collectors"
+    ],
+    "steady_metric": "Excludes first decode step; both rates exclude model startup and prefill",
+    "output_check": "Historical generated-text SHA-256 at each length; one raw-completion prompt",
+    "repeat_rules": "Within each configuration: <=2% speed range, <=5% GPU clock range. Screening rules, not confidence intervals."
+  },
+  "binaries": {
+    "A": {
+      "binary_sha256": "1b390cf54bf5af5320a9f53fae2b7c3b81a2786ed8706d896da5351e6be3ea3e",
+      "runtime_shader_sha256": {
+        "argsort.metal": "a36f9e1ca3a2d8272cb52cece7d3d0624cd45de4b2887446f525e9ec64abd5de",
+        "bin.metal": "4b537679fe874fa4dea079bbb10634b3feeb2cce9b737bdb602fe6926fbb175a",
+        "concat.metal": "04fb0fc2a3b51015444e330290b979a56e4cac82aee523afa2b42e361ab23da7",
+        "cpy.metal": "df8cabe88c33076c16a54cfb88a00133b68ea5cbfc1742ac79608c84d4456cd4",
+        "deepseek4_vision.metal": "e0908e53ab5b33903408e5723434a59b28fb90a998123a32a794570fdf5a27ea",
+        "dense.metal": "e96ac344a47e7e99cc29315114bb579480d3ed7e074f1b2df03c2c402d01e8ac",
+        "dsv41.metal": "2000ee67dc2983f931103659ee7596e3619b34db5d7d971db42616a2bcee847c",
+        "dsv4_hc.metal": "5d1988269671c9cfa9ad09024dd1c04b77559ea3894628e9bfddab44005b80d3",
+        "dsv4_kv.metal": "65e6e12ac3266fdf72b1e9c69bfbd07ea7324e930a8117b63b651b5016b1b5f6",
+        "dsv4_misc.metal": "94e48cd289bada052adbb9d84b0d4799bbc38b342ca89ade62d7a2d5cc2a37b3",
+        "dsv4_rope.metal": "f56cb24a381c27435953d120448bc22c1b2314b151280445246bd28920b4d518",
+        "flash_attn.metal": "c9ec79daf2063cd9e8c4e8874c123fbf2642c3fb6247b16aa21e1e0e6db92fcc",
+        "get_rows.metal": "bd3b352a6ffb138ae5e391db97b211f8386d417365eac2caa3730f55a075aa3a",
+        "glm53_bf16.metal": "27d93dcfe81b09f93ed65cd986aaa0b9c1ca1df7fc43e58c15da533284d50db5",
+        "glm53_kda.metal": "a695c313e36b76fa260164c6f5a2f3203748cbcff9becc6707e71aa703ed0818",
+        "glm53_vision.metal": "d20bdf039f9bd9d7b0cab8c6a4fc10bcb3097571a81246dbde1c278e0e9bec7b",
+        "glu.metal": "59281e30a27cc2eb618800b6e53a57e234f65f1a1e680d6267d9139e1a06b627",
+        "moe.metal": "d3ec9d2394976a284e11b0d9b148c9617d195ac704ce994f4a6014abd61973cc",
+        "norm.metal": "700bf92792e70a969c1f564c3c0ea7c8c9fe707d51a3537b766a9d336acfddd6",
+        "repeat.metal": "2c6142b47a2007d246f5eb6e7395047627bb6dfa02c649311d16620da35007cd",
+        "set_rows.metal": "25f597bf5f5fb5a3791efc68e3182539727609f09c45750ef9376ed430d7a029",
+        "softmax.metal": "6eaa6ce78c4b221b3c7fe45647d6eb42f165201992a243d77d04cf2668fb7664",
+        "sum_rows.metal": "7e1f3ad3f945b1f6f59aa2d8ee5bf464052d989a632c33ea95ce50d3c4fbf0fc",
+        "unary.metal": "56be9a0316b02d4f16cdf9487074e5a7c94215a15d9b58917e38c474cbe16dde"
+      }
+    },
+    "B": {
+      "binary_sha256": "91e3c40a611dc7655922626085eba846dbc3ac4e2cd9b860f8899aa840e487aa",
+      "runtime_shader_sha256": {
+        "argsort.metal": "a36f9e1ca3a2d8272cb52cece7d3d0624cd45de4b2887446f525e9ec64abd5de",
+        "bin.metal": "4b537679fe874fa4dea079bbb10634b3feeb2cce9b737bdb602fe6926fbb175a",
+        "concat.metal": "04fb0fc2a3b51015444e330290b979a56e4cac82aee523afa2b42e361ab23da7",
+        "cpy.metal": "df8cabe88c33076c16a54cfb88a00133b68ea5cbfc1742ac79608c84d4456cd4",
+        "deepseek4_vision.metal": "e0908e53ab5b33903408e5723434a59b28fb90a998123a32a794570fdf5a27ea",
+        "dense.metal": "2e054c7acccc8dd3956f48f22f2daed409413f6ff0ac4edd7a3faff9dd938ca2",
+        "dsv41.metal": "2f54c91a9819844d641ee6836d42e541080b1f6c7a33496a78043aa4256c0b6f",
+        "dsv4_hc.metal": "5d1988269671c9cfa9ad09024dd1c04b77559ea3894628e9bfddab44005b80d3",
+        "dsv4_kv.metal": "65e6e12ac3266fdf72b1e9c69bfbd07ea7324e930a8117b63b651b5016b1b5f6",
+        "dsv4_misc.metal": "94e48cd289bada052adbb9d84b0d4799bbc38b342ca89ade62d7a2d5cc2a37b3",
+        "dsv4_rope.metal": "f56cb24a381c27435953d120448bc22c1b2314b151280445246bd28920b4d518",
+        "flash_attn.metal": "c9ec79daf2063cd9e8c4e8874c123fbf2642c3fb6247b16aa21e1e0e6db92fcc",
+        "get_rows.metal": "bd3b352a6ffb138ae5e391db97b211f8386d417365eac2caa3730f55a075aa3a",
+        "glm53_bf16.metal": "27d93dcfe81b09f93ed65cd986aaa0b9c1ca1df7fc43e58c15da533284d50db5",
+        "glm53_kda.metal": "a695c313e36b76fa260164c6f5a2f3203748cbcff9becc6707e71aa703ed0818",
+        "glm53_vision.metal": "d20bdf039f9bd9d7b0cab8c6a4fc10bcb3097571a81246dbde1c278e0e9bec7b",
+        "glu.metal": "59281e30a27cc2eb618800b6e53a57e234f65f1a1e680d6267d9139e1a06b627",
+        "moe.metal": "a8340cfa8188405273cbd0d02a1fcbd67824c450faf145996bfa24280ee5b9f6",
+        "norm.metal": "8daa595804624d785b0dc8d98cd0ca201e215fd072b5ae5c8cd95a4d8db65a44",
+        "repeat.metal": "2c6142b47a2007d246f5eb6e7395047627bb6dfa02c649311d16620da35007cd",
+        "set_rows.metal": "25f597bf5f5fb5a3791efc68e3182539727609f09c45750ef9376ed430d7a029",
+        "softmax.metal": "6eaa6ce78c4b221b3c7fe45647d6eb42f165201992a243d77d04cf2668fb7664",
+        "sum_rows.metal": "7e1f3ad3f945b1f6f59aa2d8ee5bf464052d989a632c33ea95ce50d3c4fbf0fc",
+        "unary.metal": "56be9a0316b02d4f16cdf9487074e5a7c94215a15d9b58917e38c474cbe16dde"
+      }
+    }
+  },
+  "groups": [
+    {
+      "generated_tokens": 200,
+      "sequence": "ABBA",
+      "configurations": {
+        "A": {
+          "n": 2,
+          "steady_median": 18.405,
+          "steady_range": [
+            18.39,
+            18.42
+          ],
+          "steady_range_pct": 0.16299918500408114,
+          "inclusive_median": 17.845,
+          "inclusive_range": [
+            17.78,
+            17.91
+          ],
+          "gpu_decode_active_mhz": [
+            1620.0,
+            1619.9999999999998
+          ]
+        },
+        "B": {
+          "n": 2,
+          "steady_median": 19.58,
+          "steady_range": [
+            19.58,
+            19.58
+          ],
+          "steady_range_pct": 0.0,
+          "inclusive_median": 19.03,
+          "inclusive_range": [
+            19.03,
+            19.03
+          ],
+          "gpu_decode_active_mhz": [
+            1620.0,
+            1620.0000000000007
+          ]
+        }
+      },
+      "steady_gain_pct": 6.384134745992931,
+      "inclusive_gain_pct": 6.640515550574411
+    },
+    {
+      "generated_tokens": 512,
+      "sequence": "BAAB",
+      "configurations": {
+        "A": {
+          "n": 2,
+          "steady_median": 18.79,
+          "steady_range": [
+            18.78,
+            18.8
+          ],
+          "steady_range_pct": 0.10643959552953472,
+          "inclusive_median": 18.58,
+          "inclusive_range": [
+            18.57,
+            18.59
+          ],
+          "gpu_decode_active_mhz": [
+            1620.0000000000007,
+            1620.0
+          ]
+        },
+        "B": {
+          "n": 2,
+          "steady_median": 19.905,
+          "steady_range": [
+            19.9,
+            19.91
+          ],
+          "steady_range_pct": 0.0502386335091764,
+          "inclusive_median": 19.67,
+          "inclusive_range": [
+            19.66,
+            19.68
+          ],
+          "gpu_decode_active_mhz": [
+            1619.999999999999,
+            1619.9999999999989
+          ]
+        }
+      },
+      "steady_gain_pct": 5.9340074507717055,
+      "inclusive_gain_pct": 5.866523143164715
+    }
+  ],
+  "repeat_gates_pass": true,
+  "arms": [
+    {
+      "arm": "tg200-1A",
+      "label": "A",
+      "prompt_tokens": 512,
+      "generated_tokens": 200,
+      "prefill_tok_s": 43.78,
+      "generation_tok_s": 17.78,
+      "steady_tokens": 199,
+      "steady_tok_s": 18.39,
+      "first_decode_step_ms": 423.445,
+      "output_sha256": "8182ab832dcc07c11d4d36028b9b3f4f5cc672538011495e60fcb4f40b91044f",
+      "runtime_cache": {
+        "requested_experts": 4200,
+        "observed_budgets": [
+          4200
+        ],
+        "allocation_reduced": false,
+        "matches_requested": true
+      },
+      "swap_growth_mb": 0.0,
+      "csv": "arms/tg200-1A.csv",
+      "csv_sha256": "53889de540fa14b6a6abdcea734485f07137740c67f3cec10ddf52b1c97240b9",
+      "expert_counters_close": true,
+      "engine_prefill_to_first_token_ready_seconds": 11.693886999972165,
+      "phase_accounting": {
+        "prefill": {
+          "seconds": 11.693848000024445,
+          "aggregate_mean_GBs": 12.81268477090703,
+          "aggregate_peak_synchronized_sample_GBs": 26.124279201453472,
+          "expert_application_bytes_by_source": [
+            76155027456,
+            37117231104,
+            36305633280
+          ],
+          "engram_application_bytes_internal": 6352368,
+          "instrumented_application_bytes": 149584244208,
+          "physical_minus_instrumented_bytes": 245343975.21484375,
+          "residual_pct_of_physical": 0.16374868154535127,
+          "devices": {
+            "primary": {
+              "physical_read_bytes_interpolated": 76478762212.89062,
+              "physical_read_bytes_boundary_bounds": [
+                76286816256,
+                76586270720
+              ],
+              "mean_GBs": 6.54008519802299,
+              "peak_sample_GBs": 13.269734156913948
+            },
+            "enclosure_1": {
+              "physical_read_bytes_interpolated": 37078075409.74219,
+              "physical_read_bytes_boundary_bounds": [
+                36981178368,
+                37133746176
+              ],
+              "mean_GBs": 3.170733483936569,
+              "peak_sample_GBs": 6.546545537726933
+            },
+            "enclosure_2": {
+              "physical_read_bytes_interpolated": 36272750560.58203,
+              "physical_read_bytes_boundary_bounds": [
+                36189241344,
+                36322148352
+              ],
+              "mean_GBs": 3.101866088947471,
+              "peak_sample_GBs": 6.415766348269769
+            }
+          }
+        },
+        "decode": {
+          "seconds": 11.245756999938749,
+          "aggregate_mean_GBs": 5.119180102372537,
+          "aggregate_peak_synchronized_sample_GBs": 8.244731973673325,
+          "expert_application_bytes_by_source": [
+            25693126656,
+            15898509312,
+            15898509312
+          ],
+          "engram_application_bytes_internal": 2534400,
+          "instrumented_application_bytes": 57492679680,
+          "physical_minus_instrumented_bytes": 76375790.203125,
+          "residual_pct_of_physical": 0.13266813148021156,
+          "devices": {
+            "primary": {
+              "physical_read_bytes_interpolated": 25820499283.234375,
+              "physical_read_bytes_boundary_bounds": [
+                25706655744,
+                25860272128
+              ],
+              "mean_GBs": 2.2960214491007593,
+              "peak_sample_GBs": 3.6933341755440403
+            },
+            "enclosure_1": {
+              "physical_read_bytes_interpolated": 15874278093.484375,
+              "physical_read_bytes_boundary_bounds": [
+                15804923904,
+                15898509312
+              ],
+              "mean_GBs": 1.4115793266358891,
+              "peak_sample_GBs": 2.275698899064642
+            },
+            "enclosure_2": {
+              "physical_read_bytes_interpolated": 15874278093.484375,
+              "physical_read_bytes_boundary_bounds": [
+                15804923904,
+                15898509312
+              ],
+              "mean_GBs": 1.4115793266358891,
+              "peak_sample_GBs": 2.275698899064642
+            }
+          }
+        }
+      },
+      "gpu_decode": {
+        "samples": 81,
+        "active_weighted_mhz": 1620.0,
+        "idle_pct": 0.0,
+        "gpu_w": 30.16263341282505
+      }
+    },
+    {
+      "arm": "tg200-2B",
+      "label": "B",
+      "prompt_tokens": 512,
+      "generated_tokens": 200,
+      "prefill_tok_s": 45.32,
+      "generation_tok_s": 19.03,
+      "steady_tokens": 199,
+      "steady_tok_s": 19.58,
+      "first_decode_step_ms": 346.146,
+      "output_sha256": "8182ab832dcc07c11d4d36028b9b3f4f5cc672538011495e60fcb4f40b91044f",
+      "runtime_cache": {
+        "requested_experts": 4200,
+        "observed_budgets": [
+          4200
+        ],
+        "allocation_reduced": false,
+        "matches_requested": true
+      },
+      "swap_growth_mb": 0.0,
+      "csv": "arms/tg200-2B.csv",
+      "csv_sha256": "83a979f51d5fcf5dfcf5ecc38e74ca8dc229dbfe84d99ecedacef80beb195fb3",
+      "expert_counters_close": true,
+      "engine_prefill_to_first_token_ready_seconds": 11.297996000037529,
+      "phase_accounting": {
+        "prefill": {
+          "seconds": 11.297937000053935,
+          "aggregate_mean_GBs": 13.266059800985,
+          "aggregate_peak_synchronized_sample_GBs": 26.342195206133272,
+          "expert_application_bytes_by_source": [
+            76155027456,
+            37117231104,
+            36305633280
+          ],
+          "engram_application_bytes_internal": 6352368,
+          "instrumented_application_bytes": 149584244208,
+          "physical_minus_instrumented_bytes": 294863662.4765625,
+          "residual_pct_of_physical": 0.19673433253377753,
+          "devices": {
+            "primary": {
+              "physical_read_bytes_interpolated": 76504122613.45312,
+              "physical_read_bytes_boundary_bounds": [
+                76226154496,
+                76584488960
+              ],
+              "mean_GBs": 6.77151258792538,
+              "peak_sample_GBs": 13.295288323095551
+            },
+            "enclosure_1": {
+              "physical_read_bytes_interpolated": 37091436687.16797,
+              "physical_read_bytes_boundary_bounds": [
+                36953128960,
+                37133746176
+              ],
+              "mean_GBs": 3.283027395797206,
+              "peak_sample_GBs": 6.56146432152771
+            },
+            "enclosure_2": {
+              "physical_read_bytes_interpolated": 36283548569.85547,
+              "physical_read_bytes_boundary_bounds": [
+                36163289088,
+                36322148352
+              ],
+              "mean_GBs": 3.211519817262413,
+              "peak_sample_GBs": 6.48544256151001
+            }
+          }
+        },
+        "decode": {
+          "seconds": 10.510892999940552,
+          "aggregate_mean_GBs": 5.427191578408673,
+          "aggregate_peak_synchronized_sample_GBs": 8.732884143798929,
+          "expert_application_bytes_by_source": [
+            25452920832,
+            15749873664,
+            15749873664
+          ],
+          "engram_application_bytes_internal": 2534400,
+          "instrumented_application_bytes": 56955202560,
+          "physical_minus_instrumented_bytes": 89427410.83203125,
+          "residual_pct_of_physical": 0.15676744836062068,
+          "devices": {
+            "primary": {
+              "physical_read_bytes_interpolated": 25582671635.109375,
+              "physical_read_bytes_boundary_bounds": [
+                25550106624,
+                25613332480
+              ],
+              "mean_GBs": 2.4339198995988323,
+              "peak_sample_GBs": 3.90776350614284
+            },
+            "enclosure_1": {
+              "physical_read_bytes_interpolated": 15730979167.861328,
+              "physical_read_bytes_boundary_bounds": [
+                15711338496,
+                15749873664
+              ],
+              "mean_GBs": 1.4966358394049204,
+              "peak_sample_GBs": 2.412560318828044
+            },
+            "enclosure_2": {
+              "physical_read_bytes_interpolated": 15730979167.861328,
+              "physical_read_bytes_boundary_bounds": [
+                15711338496,
+                15749873664
+              ],
+              "mean_GBs": 1.4966358394049204,
+              "peak_sample_GBs": 2.412560318828044
+            }
+          }
+        }
+      },
+      "gpu_decode": {
+        "samples": 73,
+        "active_weighted_mhz": 1620.0,
+        "idle_pct": 0.0,
+        "gpu_w": 30.3088816340808
+      }
+    },
+    {
+      "arm": "tg200-3B",
+      "label": "B",
+      "prompt_tokens": 512,
+      "generated_tokens": 200,
+      "prefill_tok_s": 45.21,
+      "generation_tok_s": 19.03,
+      "steady_tokens": 199,
+      "steady_tok_s": 19.58,
+      "first_decode_step_ms": 347.612,
+      "output_sha256": "8182ab832dcc07c11d4d36028b9b3f4f5cc672538011495e60fcb4f40b91044f",
+      "runtime_cache": {
+        "requested_experts": 4200,
+        "observed_budgets": [
+          4200
+        ],
+        "allocation_reduced": false,
+        "matches_requested": true
+      },
+      "swap_growth_mb": 0.0,
+      "csv": "arms/tg200-3B.csv",
+      "csv_sha256": "7b4356e9bdd67f98f996b52b0026ef3059054de96cfde7b01bdab92aaadd6e75",
+      "expert_counters_close": true,
+      "engine_prefill_to_first_token_ready_seconds": 11.324891000054777,
+      "phase_accounting": {
+        "prefill": {
+          "seconds": 11.324843000038527,
+          "aggregate_mean_GBs": 13.239383723887126,
+          "aggregate_peak_synchronized_sample_GBs": 26.528291509365673,
+          "expert_application_bytes_by_source": [
+            76155027456,
+            37117231104,
+            36305633280
+          ],
+          "engram_application_bytes_internal": 6352368,
+          "instrumented_application_bytes": 149584244208,
+          "physical_minus_instrumented_bytes": 349697882.2871094,
+          "residual_pct_of_physical": 0.23323463480772658,
+          "devices": {
+            "primary": {
+              "physical_read_bytes_interpolated": 76534121804.64062,
+              "physical_read_bytes_boundary_bounds": [
+                76013084672,
+                76586618880
+              ],
+              "mean_GBs": 6.758073538359892,
+              "peak_sample_GBs": 13.306890150761463
+            },
+            "enclosure_1": {
+              "physical_read_bytes_interpolated": 37105221795.99414,
+              "physical_read_bytes_boundary_bounds": [
+                36839358464,
+                37133746176
+              ],
+              "mean_GBs": 3.276444697367364,
+              "peak_sample_GBs": 6.704138144733938
+            },
+            "enclosure_2": {
+              "physical_read_bytes_interpolated": 36294598489.65234,
+              "physical_read_bytes_boundary_bounds": [
+                36044013568,
+                36322148352
+              ],
+              "mean_GBs": 3.204865488159869,
+              "peak_sample_GBs": 6.517263213870274
+            }
+          }
+        },
+        "decode": {
+          "seconds": 10.512251000036485,
+          "aggregate_mean_GBs": 5.424012748569405,
+          "aggregate_peak_synchronized_sample_GBs": 8.456054394262134,
+          "expert_application_bytes_by_source": [
+            25452920832,
+            15749873664,
+            15749873664
+          ],
+          "engram_application_bytes_internal": 2534400,
+          "instrumented_application_bytes": 56955202560,
+          "physical_minus_instrumented_bytes": 63380880.359375,
+          "residual_pct_of_physical": 0.11115828653595103,
+          "devices": {
+            "primary": {
+              "physical_read_bytes_interpolated": 25574047869.75,
+              "physical_read_bytes_boundary_bounds": [
+                25529110528,
+                25618890752
+              ],
+              "mean_GBs": 2.4327851256273503,
+              "peak_sample_GBs": 3.7882333627795686
+            },
+            "enclosure_1": {
+              "physical_read_bytes_interpolated": 15722267785.304688,
+              "physical_read_bytes_boundary_bounds": [
+                15694823424,
+                15749873664
+              ],
+              "mean_GBs": 1.4956138114710273,
+              "peak_sample_GBs": 2.339091227207967
+            },
+            "enclosure_2": {
+              "physical_read_bytes_interpolated": 15722267785.304688,
+              "physical_read_bytes_boundary_bounds": [
+                15694823424,
+                15749873664
+              ],
+              "mean_GBs": 1.4956138114710273,
+              "peak_sample_GBs": 2.328729804274598
+            }
+          }
+        }
+      },
+      "gpu_decode": {
+        "samples": 72,
+        "active_weighted_mhz": 1620.0000000000007,
+        "idle_pct": 0.0,
+        "gpu_w": 30.999661926056017
+      }
+    },
+    {
+      "arm": "tg200-4A",
+      "label": "A",
+      "prompt_tokens": 512,
+      "generated_tokens": 200,
+      "prefill_tok_s": 45.26,
+      "generation_tok_s": 17.91,
+      "steady_tokens": 199,
+      "steady_tok_s": 18.42,
+      "first_decode_step_ms": 359.816,
+      "output_sha256": "8182ab832dcc07c11d4d36028b9b3f4f5cc672538011495e60fcb4f40b91044f",
+      "runtime_cache": {
+        "requested_experts": 4200,
+        "observed_budgets": [
+          4200
+        ],
+        "allocation_reduced": false,
+        "matches_requested": true
+      },
+      "swap_growth_mb": 0.0,
+      "csv": "arms/tg200-4A.csv",
+      "csv_sha256": "6e49985efafe9de0103e92d2930a6ff73c69a4bff39d644d06a188586d16a49b",
+      "expert_counters_close": true,
+      "engine_prefill_to_first_token_ready_seconds": 11.313110999995843,
+      "phase_accounting": {
+        "prefill": {
+          "seconds": 11.313066000002436,
+          "aggregate_mean_GBs": 13.258592607318128,
+          "aggregate_peak_synchronized_sample_GBs": 26.282102463711926,
+          "expert_application_bytes_by_source": [
+            76155027456,
+            37117231104,
+            36305633280
+          ],
+          "engram_application_bytes_internal": 6352368,
+          "instrumented_application_bytes": 149584244208,
+          "physical_minus_instrumented_bytes": 411089025.734375,
+          "residual_pct_of_physical": 0.2740678772277429,
+          "devices": {
+            "primary": {
+              "physical_read_bytes_interpolated": 76563750594.29688,
+              "physical_read_bytes_boundary_bounds": [
+                76556083200,
+                76565766144
+              ],
+              "mean_GBs": 6.767727740144041,
+              "peak_sample_GBs": 13.310307430102432
+            },
+            "enclosure_1": {
+              "physical_read_bytes_interpolated": 37121590231.71875,
+              "physical_read_bytes_boundary_bounds": [
+                37117231104,
+                37122736128
+              ],
+              "mean_GBs": 3.2813023659289846,
+              "peak_sample_GBs": 6.586923385645497
+            },
+            "enclosure_2": {
+              "physical_read_bytes_interpolated": 36309992407.71875,
+              "physical_read_bytes_boundary_bounds": [
+                36305633280,
+                36311138304
+              ],
+              "mean_GBs": 3.209562501245103,
+              "peak_sample_GBs": 6.466940822601141
+            }
+          }
+        },
+        "decode": {
+          "seconds": 11.16695800004527,
+          "aggregate_mean_GBs": 5.151985564167539,
+          "aggregate_peak_synchronized_sample_GBs": 8.112474320651382,
+          "expert_application_bytes_by_source": [
+            25693126656,
+            15898509312,
+            15898509312
+          ],
+          "engram_application_bytes_internal": 2534400,
+          "instrumented_application_bytes": 57492679680,
+          "physical_minus_instrumented_bytes": 39326731.8984375,
+          "residual_pct_of_physical": 0.06835626697403721,
+          "devices": {
+            "primary": {
+              "physical_read_bytes_interpolated": 25800090248.890625,
+              "physical_read_bytes_boundary_bounds": [
+                25745342464,
+                25853693952
+              ],
+              "mean_GBs": 2.3103955659890576,
+              "peak_sample_GBs": 3.6303044672597635
+            },
+            "enclosure_1": {
+              "physical_read_bytes_interpolated": 15865958081.503906,
+              "physical_read_bytes_boundary_bounds": [
+                15832449024,
+                15898509312
+              ],
+              "mean_GBs": 1.4207949990892406,
+              "peak_sample_GBs": 2.2410849266958093
+            },
+            "enclosure_2": {
+              "physical_read_bytes_interpolated": 15865958081.503906,
+              "physical_read_bytes_boundary_bounds": [
+                15832449024,
+                15898509312
+              ],
+              "mean_GBs": 1.4207949990892406,
+              "peak_sample_GBs": 2.2410849266958093
+            }
+          }
+        }
+      },
+      "gpu_decode": {
+        "samples": 81,
+        "active_weighted_mhz": 1619.9999999999998,
+        "idle_pct": 0.0,
+        "gpu_w": 31.922970086251286
+      }
+    },
+    {
+      "arm": "tg512-1B",
+      "label": "B",
+      "prompt_tokens": 512,
+      "generated_tokens": 512,
+      "prefill_tok_s": 44.93,
+      "generation_tok_s": 19.66,
+      "steady_tokens": 511,
+      "steady_tok_s": 19.9,
+      "first_decode_step_ms": 345.767,
+      "output_sha256": "f14f5a1dcb74375d8d3e98fba56cc1cdea2d410117fd41decb82d0d273fd1ec4",
+      "runtime_cache": {
+        "requested_experts": 4200,
+        "observed_budgets": [
+          4200
+        ],
+        "allocation_reduced": false,
+        "matches_requested": true
+      },
+      "swap_growth_mb": 0.0,
+      "csv": "arms/tg512-1B.csv",
+      "csv_sha256": "1792d46dff905f6c9a469e181aae0211800a7a03d27d73d5b04872a5da73e94b",
+      "expert_counters_close": true,
+      "engine_prefill_to_first_token_ready_seconds": 11.396488000056706,
+      "phase_accounting": {
+        "prefill": {
+          "seconds": 11.396428999956697,
+          "aggregate_mean_GBs": 13.156949547250088,
+          "aggregate_peak_synchronized_sample_GBs": 26.25906930622158,
+          "expert_application_bytes_by_source": [
+            76155027456,
+            37117231104,
+            36305633280
+          ],
+          "engram_application_bytes_internal": 6352368,
+          "instrumented_application_bytes": 149584244208,
+          "physical_minus_instrumented_bytes": 357997163.2480469,
+          "residual_pct_of_physical": 0.238756710566749,
+          "devices": {
+            "primary": {
+              "physical_read_bytes_interpolated": 76537401073.20312,
+              "physical_read_bytes_boundary_bounds": [
+                76100456448,
+                76583358464
+              ],
+              "mean_GBs": 6.71591084132529,
+              "peak_sample_GBs": 13.333703285244122
+            },
+            "enclosure_1": {
+              "physical_read_bytes_interpolated": 37107734200.11328,
+              "physical_read_bytes_boundary_bounds": [
+                36883136512,
+                37133746176
+              ],
+              "mean_GBs": 3.256084357675047,
+              "peak_sample_GBs": 6.596527516175218
+            },
+            "enclosure_2": {
+              "physical_read_bytes_interpolated": 36297106097.93164,
+              "physical_read_bytes_boundary_bounds": [
+                36095393792,
+                36322148352
+              ],
+              "mean_GBs": 3.1849543482497507,
+              "peak_sample_GBs": 6.456297647067807
+            }
+          }
+        },
+        "decode": {
+          "seconds": 26.037072999984957,
+          "aggregate_mean_GBs": 5.134195318207873,
+          "aggregate_peak_synchronized_sample_GBs": 10.367139830344849,
+          "expert_application_bytes_by_source": [
+            59588837376,
+            36872650752,
+            36872650752
+          ],
+          "engram_application_bytes_internal": 6488064,
+          "instrumented_application_bytes": 133340626944,
+          "physical_minus_instrumented_bytes": 338791352.359375,
+          "residual_pct_of_physical": 0.2534356871663629,
+          "devices": {
+            "primary": {
+              "physical_read_bytes_interpolated": 59969447677.640625,
+              "physical_read_bytes_boundary_bounds": [
+                59916951552,
+                59998216192
+              ],
+              "mean_GBs": 2.303233073766597,
+              "peak_sample_GBs": 4.64191487567688
+            },
+            "enclosure_1": {
+              "physical_read_bytes_interpolated": 36854985309.359375,
+              "physical_read_bytes_boundary_bounds": [
+                36823105536,
+                36872650752
+              ],
+              "mean_GBs": 1.4154811222206378,
+              "peak_sample_GBs": 2.8626124773339843
+            },
+            "enclosure_2": {
+              "physical_read_bytes_interpolated": 36854985309.359375,
+              "physical_read_bytes_boundary_bounds": [
+                36823105536,
+                36872650752
+              ],
+              "mean_GBs": 1.4154811222206378,
+              "peak_sample_GBs": 2.8626124773339843
+            }
+          }
+        }
+      },
+      "gpu_decode": {
+        "samples": 208,
+        "active_weighted_mhz": 1619.999999999999,
+        "idle_pct": 0.0,
+        "gpu_w": 32.31909112034187
+      }
+    },
+    {
+      "arm": "tg512-2A",
+      "label": "A",
+      "prompt_tokens": 512,
+      "generated_tokens": 512,
+      "prefill_tok_s": 45.24,
+      "generation_tok_s": 18.57,
+      "steady_tokens": 511,
+      "steady_tok_s": 18.78,
+      "first_decode_step_ms": 357.56,
+      "output_sha256": "f14f5a1dcb74375d8d3e98fba56cc1cdea2d410117fd41decb82d0d273fd1ec4",
+      "runtime_cache": {
+        "requested_experts": 4200,
+        "observed_budgets": [
+          4200
+        ],
+        "allocation_reduced": false,
+        "matches_requested": true
+      },
+      "swap_growth_mb": 0.0,
+      "csv": "arms/tg512-2A.csv",
+      "csv_sha256": "b505adcd73698bf57c76930623f99d03a78c667e03bbada27b27a4faa0e3a636",
+      "expert_counters_close": true,
+      "engine_prefill_to_first_token_ready_seconds": 11.316998000023887,
+      "phase_accounting": {
+        "prefill": {
+          "seconds": 11.31695300003048,
+          "aggregate_mean_GBs": 13.251263144101085,
+          "aggregate_peak_synchronized_sample_GBs": 26.382991366142768,
+          "expert_application_bytes_by_source": [
+            76155027456,
+            37117231104,
+            36305633280
+          ],
+          "engram_application_bytes_internal": 6352368,
+          "instrumented_application_bytes": 149584244208,
+          "physical_minus_instrumented_bytes": 379677984.828125,
+          "residual_pct_of_physical": 0.25317955097221556,
+          "devices": {
+            "primary": {
+              "physical_read_bytes_interpolated": 76548644630.60938,
+              "physical_read_bytes_boundary_bounds": [
+                76066672640,
+                76585226240
+              ],
+              "mean_GBs": 6.764068440542538,
+              "peak_sample_GBs": 13.248266243084602
+            },
+            "enclosure_1": {
+              "physical_read_bytes_interpolated": 37113064412.80859,
+              "physical_read_bytes_boundary_bounds": [
+                36866097152,
+                37133746176
+              ],
+              "mean_GBs": 3.2794219798128204,
+              "peak_sample_GBs": 6.645350401547241
+            },
+            "enclosure_2": {
+              "physical_read_bytes_interpolated": 36302213149.41016,
+              "physical_read_bytes_boundary_bounds": [
+                36079665152,
+                36322148352
+              ],
+              "mean_GBs": 3.2077727237457276,
+              "peak_sample_GBs": 6.543114241523438
+            }
+          }
+        },
+        "decode": {
+          "seconds": 27.56969100004062,
+          "aggregate_mean_GBs": 4.875210938975282,
+          "aggregate_peak_synchronized_sample_GBs": 10.059544541661928,
+          "expert_application_bytes_by_source": [
+            59900215296,
+            37065326592,
+            37065326592
+          ],
+          "engram_application_bytes_internal": 6488064,
+          "instrumented_application_bytes": 134037356544,
+          "physical_minus_instrumented_bytes": 370702603.56640625,
+          "residual_pct_of_physical": 0.275803851284998,
+          "devices": {
+            "primary": {
+              "physical_read_bytes_interpolated": 60296269671.5,
+              "physical_read_bytes_boundary_bounds": [
+                60158152704,
+                60311797760
+              ],
+              "mean_GBs": 2.1870491646573464,
+              "peak_sample_GBs": 4.5045253686704285
+            },
+            "enclosure_1": {
+              "physical_read_bytes_interpolated": 37055894738.0332,
+              "physical_read_bytes_boundary_bounds": [
+                36971741184,
+                37065326592
+              ],
+              "mean_GBs": 1.3440808871589678,
+              "peak_sample_GBs": 2.7775095864957495
+            },
+            "enclosure_2": {
+              "physical_read_bytes_interpolated": 37055894738.0332,
+              "physical_read_bytes_boundary_bounds": [
+                36971741184,
+                37065326592
+              ],
+              "mean_GBs": 1.3440808871589678,
+              "peak_sample_GBs": 2.7775095864957495
+            }
+          }
+        }
+      },
+      "gpu_decode": {
+        "samples": 226,
+        "active_weighted_mhz": 1620.0000000000007,
+        "idle_pct": 0.0,
+        "gpu_w": 33.662920249757335
+      }
+    },
+    {
+      "arm": "tg512-3A",
+      "label": "A",
+      "prompt_tokens": 512,
+      "generated_tokens": 512,
+      "prefill_tok_s": 45.18,
+      "generation_tok_s": 18.59,
+      "steady_tokens": 511,
+      "steady_tok_s": 18.8,
+      "first_decode_step_ms": 357.098,
+      "output_sha256": "f14f5a1dcb74375d8d3e98fba56cc1cdea2d410117fd41decb82d0d273fd1ec4",
+      "runtime_cache": {
+        "requested_experts": 4200,
+        "observed_budgets": [
+          4200
+        ],
+        "allocation_reduced": false,
+        "matches_requested": true
+      },
+      "swap_growth_mb": 0.0,
+      "csv": "arms/tg512-3A.csv",
+      "csv_sha256": "23e652032674c3d0518beee45d07cc4e350949a15b62dda3c45366041e8624da",
+      "expert_counters_close": true,
+      "engine_prefill_to_first_token_ready_seconds": 11.333349999971688,
+      "phase_accounting": {
+        "prefill": {
+          "seconds": 11.333304999978282,
+          "aggregate_mean_GBs": 13.231277214110854,
+          "aggregate_peak_synchronized_sample_GBs": 26.374103545739843,
+          "expert_application_bytes_by_source": [
+            76155027456,
+            37117231104,
+            36305633280
+          ],
+          "engram_application_bytes_internal": 6352368,
+          "instrumented_application_bytes": 149584244208,
+          "physical_minus_instrumented_bytes": 369855998.78125,
+          "residual_pct_of_physical": 0.2466461392327599,
+          "devices": {
+            "primary": {
+              "physical_read_bytes_interpolated": 76541489436.65625,
+              "physical_read_bytes_boundary_bounds": [
+                76113928192,
+                76583034880
+              ],
+              "mean_GBs": 6.753677716853375,
+              "peak_sample_GBs": 13.25203456308548
+            },
+            "enclosure_1": {
+              "physical_read_bytes_interpolated": 37111482638.291016,
+              "physical_read_bytes_boundary_bounds": [
+                36898603008,
+                37133746176
+              ],
+              "mean_GBs": 3.2745507721147655,
+              "peak_sample_GBs": 6.629854843640238
+            },
+            "enclosure_2": {
+              "physical_read_bytes_interpolated": 36301128131.833984,
+              "physical_read_bytes_boundary_bounds": [
+                36108500992,
+                36322148352
+              ],
+              "mean_GBs": 3.2030487251427147,
+              "peak_sample_GBs": 6.552161232191329
+            }
+          }
+        },
+        "decode": {
+          "seconds": 27.543889000080526,
+          "aggregate_mean_GBs": 4.879378634957179,
+          "aggregate_peak_synchronized_sample_GBs": 9.987102413447213,
+          "expert_application_bytes_by_source": [
+            59900215296,
+            37065326592,
+            37065326592
+          ],
+          "engram_application_bytes_internal": 6488064,
+          "instrumented_application_bytes": 134037356544,
+          "physical_minus_instrumented_bytes": 359706966.625,
+          "residual_pct_of_physical": 0.267644959814589,
+          "devices": {
+            "primary": {
+              "physical_read_bytes_interpolated": 60290525617.90625,
+              "physical_read_bytes_boundary_bounds": [
+                60166479872,
+                60310396928
+              ],
+              "mean_GBs": 2.1888893619100043,
+              "peak_sample_GBs": 4.4716964741754515
+            },
+            "enclosure_1": {
+              "physical_read_bytes_interpolated": 37053268946.359375,
+              "physical_read_bytes_boundary_bounds": [
+                36977246208,
+                37065326592
+              ],
+              "mean_GBs": 1.3452446365235877,
+              "peak_sample_GBs": 2.7538097419140417
+            },
+            "enclosure_2": {
+              "physical_read_bytes_interpolated": 37053268946.359375,
+              "physical_read_bytes_boundary_bounds": [
+                36977246208,
+                37065326592
+              ],
+              "mean_GBs": 1.3452446365235877,
+              "peak_sample_GBs": 2.7615961973577194
+            }
+          }
+        }
+      },
+      "gpu_decode": {
+        "samples": 234,
+        "active_weighted_mhz": 1620.0,
+        "idle_pct": 0.0,
+        "gpu_w": 33.47746655777028
+      }
+    },
+    {
+      "arm": "tg512-4B",
+      "label": "B",
+      "prompt_tokens": 512,
+      "generated_tokens": 512,
+      "prefill_tok_s": 45.31,
+      "generation_tok_s": 19.68,
+      "steady_tokens": 511,
+      "steady_tok_s": 19.91,
+      "first_decode_step_ms": 350.157,
+      "output_sha256": "f14f5a1dcb74375d8d3e98fba56cc1cdea2d410117fd41decb82d0d273fd1ec4",
+      "runtime_cache": {
+        "requested_experts": 4200,
+        "observed_budgets": [
+          4200
+        ],
+        "allocation_reduced": false,
+        "matches_requested": true
+      },
+      "swap_growth_mb": 0.0,
+      "csv": "arms/tg512-4B.csv",
+      "csv_sha256": "24e264143bc685604076f69537a33a6a9dee54533202595218ebf7c00119e26d",
+      "expert_counters_close": true,
+      "engine_prefill_to_first_token_ready_seconds": 11.300003999960609,
+      "phase_accounting": {
+        "prefill": {
+          "seconds": 11.299961999990046,
+          "aggregate_mean_GBs": 13.270967670794843,
+          "aggregate_peak_synchronized_sample_GBs": 26.142965766086885,
+          "expert_application_bytes_by_source": [
+            76155027456,
+            37117231104,
+            36305633280
+          ],
+          "engram_application_bytes_internal": 6352368,
+          "instrumented_application_bytes": 149584244208,
+          "physical_minus_instrumented_bytes": 377186175.078125,
+          "residual_pct_of_physical": 0.2515221241319176,
+          "devices": {
+            "primary": {
+              "physical_read_bytes_interpolated": 76546796565.98438,
+              "physical_read_bytes_boundary_bounds": [
+                75935973376,
+                76582830080
+              ],
+              "mean_GBs": 6.774075573533062,
+              "peak_sample_GBs": 13.272590052776705
+            },
+            "enclosure_1": {
+              "physical_read_bytes_interpolated": 37112996581.72266,
+              "physical_read_bytes_boundary_bounds": [
+                36807901184,
+                37133746176
+              ],
+              "mean_GBs": 3.284347025393125,
+              "peak_sample_GBs": 6.506414081514893
+            },
+            "enclosure_2": {
+              "physical_read_bytes_interpolated": 36301637235.37109,
+              "physical_read_bytes_boundary_bounds": [
+                36012818432,
+                36322148352
+              ],
+              "mean_GBs": 3.212545071868655,
+              "peak_sample_GBs": 6.451363841502075
+            }
+          }
+        },
+        "decode": {
+          "seconds": 26.019032999989577,
+          "aggregate_mean_GBs": 5.138718604167108,
+          "aggregate_peak_synchronized_sample_GBs": 10.555368331389525,
+          "expert_application_bytes_by_source": [
+            59588837376,
+            36872650752,
+            36872650752
+          ],
+          "engram_application_bytes_internal": 6488064,
+          "instrumented_application_bytes": 133340626944,
+          "physical_minus_instrumented_bytes": 363861995.484375,
+          "residual_pct_of_physical": 0.27213895237957314,
+          "devices": {
+            "primary": {
+              "physical_read_bytes_interpolated": 59985216840.484375,
+              "physical_read_bytes_boundary_bounds": [
+                59952095232,
+                60006260736
+              ],
+              "mean_GBs": 2.305436056770765,
+              "peak_sample_GBs": 4.7215278647115415
+            },
+            "enclosure_1": {
+              "physical_read_bytes_interpolated": 36859636049.5,
+              "physical_read_bytes_boundary_bounds": [
+                36839620608,
+                36872650752
+              ],
+              "mean_GBs": 1.416641273698172,
+              "peak_sample_GBs": 2.9169202333389923
+            },
+            "enclosure_2": {
+              "physical_read_bytes_interpolated": 36859636049.5,
+              "physical_read_bytes_boundary_bounds": [
+                36839620608,
+                36872650752
+              ],
+              "mean_GBs": 1.416641273698172,
+              "peak_sample_GBs": 2.9169202333389923
+            }
+          }
+        }
+      },
+      "gpu_decode": {
+        "samples": 207,
+        "active_weighted_mhz": 1619.9999999999989,
+        "idle_pct": 0.0,
+        "gpu_w": 32.07355526946191
+      }
+    }
+  ],
+  "scope_notes": [
+    "All eight runs completed with historical output hashes, full cache and zero swap growth. Existing swap was present before testing.",
+    "Physical device counters include unrelated I/O and 100 ms phase-boundary uncertainty; residual is unassigned, not relabelled as application traffic.",
+    "Power-log analysis corrected Python uptime anchors into the engine POSIX monotonic domain using paired calibration; original engine timings were unchanged. Whole-second power timestamps are trimmed 1.25 s at phase edges.",
+    "One benchmark prompt is not broad model-quality validation. CUDA, RDMA and multi-machine behavior are outside this benchmark.",
+    "Candidate source was reconstructed from preserved snapshots and matched runtime shaders; the measured binary is the reconstructed binary identified here, not the historical September 20 executable."
+  ]
+}
