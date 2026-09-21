@@ -59,6 +59,24 @@ kernel void kernel_dsv41_rope(
     x[i + 1u] = dsv41_bf16(re * s + im * c);
 }
 
+// Preserve both BF16 boundaries while combining attention-head rounding and RoPE.
+kernel void kernel_dsv41_rope_bf16_input(
+        constant ds4_metal_args_dsv41_rope &args,
+        device float *x,
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    const float theta = float(args.start + group.y * args.stride) * args.frequencies[lane];
+    const float c = precise::cos(theta);
+    const float s = args.inverse ? -precise::sin(theta) : precise::sin(theta);
+    const ulong i = ((ulong)group.y * args.heads + group.x) * args.width +
+                    args.width - 64u + 2u * lane;
+    const ulong base = ((ulong)group.y * args.heads + group.x) * args.width;
+    for (uint j = lane; j < args.width - 64u; j += 32u) x[base + j] = dsv41_bf16(x[base + j]);
+    const float re = dsv41_bf16(x[i]), im = dsv41_bf16(x[i + 1u]);
+    x[i] = dsv41_bf16(re * c - im * s);
+    x[i + 1u] = dsv41_bf16(re * s + im * c);
+}
+
 kernel void kernel_dsv41_quantize(
         constant ds4_metal_args_dsv41_quantize &args,
         device float *x,
@@ -291,3 +309,48 @@ kernel void kernel_dsv41_indexer_scores_packed(
     }
 }
 #endif
+
+// V4.1's HC sum -> BF16 -> weighted RMSNorm -> BF16, retaining the
+// standalone vector reduction order and both rounding boundaries.
+kernel void kernel_dsv41_hc_sum_norm(
+        constant uint &n,
+        constant uint &hc,
+        constant float &eps,
+        device const float4 *residual,
+        device const float *weights,
+        device const float4 *norm_weight,
+        device float4 *sum_out,
+        device float4 *norm_out,
+        threadgroup float *shared [[threadgroup(0)]],
+        ushort tid [[thread_position_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nt [[threads_per_threadgroup]]) {
+    if (sg == 0) shared[lane] = 0.0f;
+    float ss = 0.0f;
+    const uint width = n / 4u;
+    for (uint i = tid; i < width; i += nt) {
+        float4 value = 0.0f;
+        for (uint h = 0; h < hc; h++) value += residual[h * width + i] * weights[h];
+        uint4 bits = as_type<uint4>(value);
+        const bool4 finite = (bits & 0x7f800000u) != 0x7f800000u;
+        bits += select(uint4(0), uint4(0x7fffu) + ((bits >> 16u) & 1u), finite);
+        value = as_type<float4>(bits & 0xffff0000u);
+        sum_out[i] = value;
+        ss += dot(value, value);
+    }
+    ss = simd_sum(ss);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) shared[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ss = simd_sum(shared[lane]);
+    const float mean = ss / n;
+    const float scale = 1.0f / sqrt(mean + eps);
+    for (uint i = tid; i < width; i += nt) {
+        const float4 value = (sum_out[i] * scale) * norm_weight[i];
+        uint4 bits = as_type<uint4>(value);
+        const bool4 finite = (bits & 0x7f800000u) != 0x7f800000u;
+        bits += select(uint4(0), uint4(0x7fffu) + ((bits >> 16u) & 1u), finite);
+        norm_out[i] = as_type<float4>(bits & 0xffff0000u);
+    }
+}

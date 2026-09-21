@@ -113,6 +113,10 @@ int ds4_gpu_dsv41_attention_output_tp_batch(
         uint64_t out_a_offset, uint64_t out_b_offset,
         const ds4_gpu_tensor *heads, uint32_t n_tokens, uint32_t tp_rank);
 /* Adjacent-pair, unit-magnitude RoPE with the released V4.1 frequencies. */
+#if defined(__APPLE__)
+int ds4_gpu_dsv41_rope_bf16_input(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+        uint32_t rows, uint32_t start, bool compressed, bool inverse);
+#endif
 int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                       uint32_t rows, uint32_t start, bool compressed, bool inverse);
 /* Compressed pairs advance two absolute token positions per stored row. */
@@ -499,6 +503,12 @@ int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
 /* Pause/resume the DVFS keep-alive around work that keeps the GPU busy.
  * No-op when TP is not bound. */
 void ds4_gpu_tp_keepalive_pause(int paused);
+/* Diagnostic single-GPU V4.1 keep-alive scope. Mode 1 admits work only in
+ * expert-read waits; mode 2 admits it throughout an active decode token. */
+#if defined(__APPLE__)
+void ds4_gpu_argodrive_keepalive_token(int active, uint32_t position);
+void ds4_gpu_argodrive_keepalive_snapshot(uint64_t out[4]);
+#endif
 /* Split attention heads across the two TP ranks in the GLM batch-prefill
  * attention kernels (qk-low, attention-lora, value-project). The caller
  * zeroes the unowned head range of the heads buffer and combines the
@@ -751,6 +761,11 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Single-row Q8 with the V4.1 BF16 boundary in its output epilogue. */
+int ds4_gpu_matmul_q8_0_bf16_tensor(ds4_gpu_tensor *out,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x);
+
 int ds4_gpu_matmul_q8_0_decode_mpp_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -822,6 +837,21 @@ int ds4_gpu_matmul_quant_rows_scalar_tensor(
  * Backends that return nonzero from a fused half-output operation must also
  * implement the matching half-input HC expansion helpers below.
  */
+#if defined(__APPLE__)
+int ds4_gpu_dsv41_qakv_bf16_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight0_offset,
+        uint64_t                weight1_offset,
+        uint64_t                in_dim,
+        uint64_t                out0_dim,
+        uint64_t                out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+#endif
+
 int ds4_gpu_matmul_q8_0_pair_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,
@@ -891,6 +921,22 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         float                   clamp);
+
+#if defined(__APPLE__)
+int ds4_gpu_dsv41_shared_gate_up_swiglu_q8_0_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        float                   clamp);
+
+#endif
 
 int ds4_gpu_router_shared_gate_up_q8_0_tensor(
         ds4_gpu_tensor       *router_logits,
@@ -1177,6 +1223,17 @@ int ds4_gpu_rms_norm_plain_rows_tensor(
         uint32_t                n,
         uint32_t                rows,
         float                   eps);
+
+#if defined(__APPLE__)
+int ds4_gpu_dsv41_rms_norm_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t offset, uint32_t n, float eps);
+#endif
+
+#if defined(__APPLE__)
+int ds4_gpu_dsv41_hc_sum_norm_tensor(ds4_gpu_tensor *norm, ds4_gpu_tensor *sum,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *weights,
+        const void *map, uint64_t size, uint64_t offset, uint32_t n, uint32_t hc, float eps);
+#endif
 
 int ds4_gpu_rms_norm_weight_tensor(
         ds4_gpu_tensor       *out,

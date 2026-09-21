@@ -29,6 +29,7 @@ int main(void){
  }
  assert(write(fd,raw,sizeof(raw))==sizeof(raw));
  setenv("DS4_ARGODRIVE_ACCOUNTING","1",1);
+ setenv("DS4_ARGODRIVE_ENGRAM_DIAGNOSTICS",path,1);
  ds4_engram_table t;assert(ds4_engram_table_open(&t,path,0,N));unlink(path);
  uint32_t ids[COUNT];for(unsigned i=0;i<COUNT;i++)ids[i]=(i*37)%N;
  ids[7]=ids[3];ids[25]=ids[3];
@@ -36,6 +37,8 @@ int main(void){
  uint64_t before=ar_engram_bytes_snapshot();
  assert(ds4_engram_read(&t,ids,COUNT,reference));
  assert(ar_engram_bytes_snapshot()-before==COUNT*DS4_ENGRAM_ROW_BYTES);
+ uint64_t stats[4];ar_engram_stats_snapshot(stats);
+ assert(stats[1]==COUNT && stats[2]==0 && stats[3]==COUNT);
  unsigned counts[]={0,1,7,24,48},readers[]={1,2,4,8,16};
  for(unsigned c=0;c<5;c++)for(unsigned r=0;r<5;r++){
   memset(got,0xa5,sizeof(got));inject_eintr=1;
@@ -61,5 +64,17 @@ int main(void){
  uint8_t bad=127;assert(pwrite(fd,&bad,1,(off_t)ids[3]*DS4_ENGRAM_ROW_BYTES)==1);
  assert(!ds4_engram_read_parallel(&t,ids,COUNT,got,8)&&errno==EDOM&&!active_reads);
  ds4_engram_table_close(&t);close(fd);
+ ar_engram_stats_snapshot(stats);
+ assert(ar_engram_io_count<AR_ENGRAM_IO_CAP && stats[2]>0);
+ uint64_t traced_bytes=0,traced_calls=0,traced_failed=0;
+ for(uint64_t i=0;i<ar_engram_io_count;i++){
+  ar_engram_io *r=&ar_engram_io_rows[i];
+  assert(r->end>=r->begin && r->calls>0);
+  traced_bytes+=r->bytes;traced_calls+=r->calls;traced_failed+=r->error!=0;
+ }
+ assert(traced_bytes==stats[0] && traced_calls==stats[1] && traced_failed==stats[2]);
+ assert(ar_engram_io_count-traced_failed==stats[3]);
+ ar_engram_io_flush();char trace_path[4096];snprintf(trace_path,sizeof(trace_path),"%s.reads.csv",path);
+ assert(access(trace_path,R_OK)==0);assert(unlink(trace_path)==0);
  puts("PASS Engram parallel: exact values/order, duplicates,1/2/4/8/16 readers, real concurrency, EINTR, EOF, recovery, invalid scalar/index/count, joined writers and canaries");return 0;
 }

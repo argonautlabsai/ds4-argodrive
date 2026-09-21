@@ -78,6 +78,8 @@ typedef struct {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
 extern void ar_expert_bytes_snapshot(uint64_t out[3]);
 extern uint64_t ar_engram_bytes_snapshot(void);
+extern void ar_engram_stats_snapshot(uint64_t out[4]);
+extern void ar_expert_calls_snapshot(uint64_t out[3]);
 #endif
 static void ar_accounting_snapshot(const char *boundary) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
@@ -86,6 +88,21 @@ static void ar_accounting_snapshot(const char *boundary) {
         fprintf(stderr,"ARGODRIVE_BYTES %s %llu %llu %llu %llu\n",boundary,
             (unsigned long long)sources[0],(unsigned long long)sources[1],
             (unsigned long long)sources[2],(unsigned long long)ar_engram_bytes_snapshot());
+        uint64_t calls[3], engram[4];
+        ar_expert_calls_snapshot(calls); ar_engram_stats_snapshot(engram);
+        fprintf(stderr,"ARGODRIVE_CALLS %s %llu %llu %llu %llu %llu %llu\n",boundary,
+            (unsigned long long)calls[0],(unsigned long long)calls[1],
+            (unsigned long long)calls[2],(unsigned long long)engram[1],
+            (unsigned long long)engram[2],(unsigned long long)engram[3]);
+        if (!strcmp(boundary,"decode_end")) {
+            for (unsigned i=0; i<3; i++)
+                fprintf(stderr,"ARGODRIVE_RUN_TOTAL source=%u expert_bytes=%llu expert_calls=%llu expert_mean_bytes=%.3f engram_bytes=%llu engram_calls=%llu engram_mean_bytes=%.3f\n",
+                    i,(unsigned long long)sources[i],(unsigned long long)calls[i],
+                    calls[i] ? (double)sources[i]/calls[i] : 0,
+                    (unsigned long long)(i==0 ? engram[0] : 0),
+                    (unsigned long long)(i==0 ? engram[1] : 0),
+                    i==0 && engram[1] ? (double)engram[0]/engram[1] : 0);
+        }
     }
 #else
     (void)boundary;

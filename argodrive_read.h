@@ -16,7 +16,7 @@
 
 /* reads/lands_last/gap_ns: barrier attribution, see ar_read. Trailing fields
  * so the positional initialisers below keep zeroing them. */
-typedef struct { int fd; unsigned weight; uint64_t bytes; uint64_t reads, lands_last, gap_ns; unsigned decode_weight; } ar_source;
+typedef struct { int fd; unsigned weight; uint64_t bytes; uint64_t reads, lands_last, gap_ns; unsigned decode_weight; uint64_t syscalls; } ar_source;
 /* Argodrive 2026-09-19: DS4_ARGODRIVE_DECODE_WEIGHTS="10,6,6" (primary first, then the
  * replicas in DS4_ARGODRIVE_REPLICAS order) gives decode its own split; prefill keeps the
  * base weights. The engine flips ar_decode_phase at the first decode expert load and
@@ -29,6 +29,45 @@ static unsigned ar_effective_weight(const ar_source *src) {
 typedef struct { ar_source source[3]; unsigned count; int invalid; int owns_primary; uint64_t size; } ar_reader;
 typedef struct { uint64_t offset, length; } ar_piece;
 
+/* Optional per-component timing, written once after readers have quiesced.
+ * Timers share CLOCK_MONOTONIC_RAW. Byte/latency records are not device I/O. */
+typedef struct {
+    uint64_t offset, length, begin, end, start[3], done[3], bytes[3], batch;
+    unsigned sources; int ok;
+} ar_read_time;
+static ar_read_time *ar_read_times;
+static uint64_t ar_read_time_count;
+static const char *ar_read_time_path;
+static __thread uint64_t ar_read_batch;
+#define AR_READ_TIME_CAP 65536u
+static void ar_read_time_flush(void) {
+    if (!ar_read_times) return;
+    FILE *f=fopen(ar_read_time_path,"wx");
+    uint64_t n=__atomic_load_n(&ar_read_time_count,__ATOMIC_RELAXED);
+    if (f) {
+        fprintf(f,"offset,length,batch,begin_ns,end_ns,start0_ns,done0_ns,bytes0,start1_ns,done1_ns,bytes1,start2_ns,done2_ns,bytes2,sources,ok\n");
+        for (uint64_t i=0;i<n && i<AR_READ_TIME_CAP;i++) {
+            ar_read_time *r=&ar_read_times[i];
+            fprintf(f,"%llu,%llu,%llu,%llu,%llu",(unsigned long long)r->offset,(unsigned long long)r->length,
+                (unsigned long long)r->batch,(unsigned long long)r->begin,(unsigned long long)r->end);
+            for(unsigned k=0;k<3;k++) fprintf(f,",%llu,%llu,%llu",(unsigned long long)r->start[k],
+                (unsigned long long)r->done[k],(unsigned long long)r->bytes[k]);
+            fprintf(f,",%u,%d\n",r->sources,r->ok);
+        }
+        fprintf(f,"# dropped=%llu\n",(unsigned long long)(n>AR_READ_TIME_CAP?n-AR_READ_TIME_CAP:0));
+        fclose(f);
+    }
+    free(ar_read_times);ar_read_times=NULL;
+}
+static void ar_read_time_init(void) {
+    static int checked;
+    if (checked) return;
+    checked=1;ar_read_time_path=getenv("DS4_ARGODRIVE_READ_TIMING");
+    if(ar_read_time_path && *ar_read_time_path) {
+        ar_read_times=calloc(AR_READ_TIME_CAP,sizeof(*ar_read_times));
+        if(ar_read_times) atexit(ar_read_time_flush);
+    }
+}
 static void ar_close(ar_reader *r) {
     for (unsigned i=0; i<r->count; i++)
         fprintf(stderr,"ds4: Argodrive source[%u] bytes=%llu\n",i,(unsigned long long)__atomic_load_n(&r->source[i].bytes,__ATOMIC_RELAXED));
@@ -52,6 +91,7 @@ static int ar_weight(const char *s, unsigned *w) {
 }
 static int ar_open(ar_reader *r, int primary, const char *paths, const char *weight) {
     ar_close(r);
+    ar_read_time_init();
     const char *uncached_env = getenv("DS4_ARGODRIVE_PRIMARY_NOCACHE");
     const int uncached = uncached_env && strcmp(uncached_env,"0") != 0;
     if ((!paths || !*paths) && !uncached) return 1;
@@ -138,34 +178,23 @@ static int ar_plan(const ar_reader *r, uint64_t offset, uint64_t length, ar_piec
     }
     return pos-offset==length;
 }
-static uint64_t ar_exact(int fd,uint64_t offset,uint64_t length,uint8_t *dst) {
+static uint64_t ar_exact(ar_source *source,uint64_t offset,uint64_t length,uint8_t *dst) {
     uint64_t n=0;
     while(n<length) {
         size_t want=length-n>SSIZE_MAX?SSIZE_MAX:(size_t)(length-n);
-        ssize_t got=pread(fd,dst+n,want,(off_t)(offset+n));
+        __atomic_fetch_add(&source->syscalls,1,__ATOMIC_RELAXED);
+        ssize_t got=pread(source->fd,dst+n,want,(off_t)(offset+n));
         if(got<0 && errno==EINTR) continue;
         if(got<=0) break;
         n+=(uint64_t)got;
     }
     return n;
 }
-static int ar_read(ar_reader *r,uint64_t offset,uint64_t length,uint8_t *dst,uint64_t *bytes) {
-    *bytes=0;
-    ar_piece pieces[3];
-    if(!dst || offset>LLONG_MAX || length>LLONG_MAX-offset || !ar_plan(r,offset,length,pieces)) return 0;
-    uint64_t counts[3]={0}, done_ns[3]={0};
-    /* Completion barrier owns dst until all disjoint writes finish, including
-     * failures. No partial buffer is accepted or retried while writes remain. */
-    ar_piece *pp=pieces; uint64_t *cc=counts, *dn=done_ns;
-    dispatch_apply(r->count,dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^(size_t i){
-        cc[i]=ar_exact(r->source[i].fd,pp[i].offset,pp[i].length,dst+(pp[i].offset-offset));
-        dn[i]=clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-        __atomic_fetch_add(&r->source[i].bytes,cc[i],__ATOMIC_RELAXED);
-    });
+static int ar_complete(ar_reader *r, const ar_piece pieces[3], const uint64_t counts[3], const uint64_t done_ns[3], uint64_t *bytes) {
     /* Barrier attribution. A split read completes when its slowest slice
      * lands, so charge this read's wait to the source that landed last and
-     * record how far behind the next-to-last it was: that gap is what removing
-     * or down-weighting the source would have saved on this read. Pieces of
+     * record how far behind the next-to-last it was. This observed gap is not
+     * a causal estimate of savings from redistributing the read. Pieces of
      * zero length did not take part; a single source has no barrier. */
     if(r->count>1) {
         int last=-1, second=-1;
@@ -182,7 +211,36 @@ static int ar_read(ar_reader *r,uint64_t offset,uint64_t length,uint8_t *dst,uin
         }
     }
     int ok=1;
+    *bytes=0;
     for(unsigned i=0;i<r->count;i++) {*bytes+=counts[i];if(counts[i]!=pieces[i].length) ok=0;}
+    return ok;
+}
+static int ar_read(ar_reader *r,uint64_t offset,uint64_t length,uint8_t *dst,uint64_t *bytes) {
+    *bytes=0;
+    ar_piece pieces[3];
+    if(!dst || offset>LLONG_MAX || length>LLONG_MAX-offset || !ar_plan(r,offset,length,pieces)) return 0;
+    uint64_t counts[3]={0}, done_ns[3]={0}, start_ns[3]={0};
+    const int trace=ar_read_times && g_ar_decode_phase;
+    const uint64_t begin=trace?clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW):0;
+    /* Completion barrier owns dst until all disjoint writes finish, including
+     * failures. No partial buffer is accepted or retried while writes remain. */
+    ar_piece *pp=pieces; uint64_t *cc=counts, *dn=done_ns, *sn=start_ns;
+    dispatch_apply(r->count,dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^(size_t i){
+        if(trace) sn[i]=clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        cc[i]=ar_exact(&r->source[i],pp[i].offset,pp[i].length,dst+(pp[i].offset-offset));
+        dn[i]=clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        __atomic_fetch_add(&r->source[i].bytes,cc[i],__ATOMIC_RELAXED);
+    });
+    int ok=ar_complete(r,pieces,counts,done_ns,bytes);
+    if(trace) {
+        uint64_t i=__atomic_fetch_add(&ar_read_time_count,1,__ATOMIC_RELAXED);
+        if(i<AR_READ_TIME_CAP) {
+            ar_read_time *t=&ar_read_times[i];
+            *t=(ar_read_time){.offset=offset,.length=length,.begin=begin,
+                .end=clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW),.batch=ar_read_batch,.sources=r->count,.ok=ok};
+            memcpy(t->start,start_ns,sizeof(start_ns));memcpy(t->done,done_ns,sizeof(done_ns));memcpy(t->bytes,counts,sizeof(counts));
+        }
+    }
     return ok;
 }
 #endif

@@ -11,6 +11,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <stdio.h>
+#include <time.h>
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
 #endif
@@ -18,7 +20,48 @@
 /* Opt-in read accounting counts successful syscall bytes, including partial
  * reads on failure. It is independent of decoded rows and physical disk I/O. */
 static uint64_t ar_engram_bytes;
+static uint64_t ar_engram_calls, ar_engram_failures, ar_engram_rows_read;
 static int ar_engram_accounting;
+/* Optional bounded syscall trace. Workers reserve disjoint rows; emit once at
+ * process exit, after the engine has joined its readers. No token text is saved. */
+typedef struct {
+    uint64_t offset, bytes, calls;
+    double begin, end;
+    int error;
+} ar_engram_io;
+enum { AR_ENGRAM_IO_CAP = 131072 };
+static ar_engram_io *ar_engram_io_rows;
+static uint64_t ar_engram_io_count;
+static const char *ar_engram_diag_path;
+static double ar_engram_now(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + 1e-9 * ts.tv_nsec;
+}
+static void ar_engram_io_flush(void) {
+    if (!ar_engram_io_rows) return;
+    char path[4096];
+    int n = snprintf(path, sizeof(path), "%s.reads.csv", ar_engram_diag_path);
+    FILE *f = n > 0 && (size_t)n < sizeof(path) ? fopen(path, "wx") : NULL;
+    if (f) {
+        uint64_t count = __atomic_load_n(&ar_engram_io_count, __ATOMIC_RELAXED);
+        fprintf(f, "offset,bytes,calls,begin_mono,end_mono,error\n");
+        for (uint64_t i = 0; i < count && i < AR_ENGRAM_IO_CAP; i++) {
+            const ar_engram_io *r = &ar_engram_io_rows[i];
+            fprintf(f, "%llu,%llu,%llu,%.9f,%.9f,%d\n",
+                (unsigned long long)r->offset, (unsigned long long)r->bytes,
+                (unsigned long long)r->calls, r->begin, r->end, r->error);
+        }
+        fprintf(f, "# dropped=%llu\n", (unsigned long long)(count > AR_ENGRAM_IO_CAP ? count - AR_ENGRAM_IO_CAP : 0));
+        fclose(f);
+    }
+    free(ar_engram_io_rows); ar_engram_io_rows = NULL;
+}
+void ar_engram_stats_snapshot(uint64_t out[4]) {
+    out[0] = __atomic_load_n(&ar_engram_bytes, __ATOMIC_RELAXED);
+    out[1] = __atomic_load_n(&ar_engram_calls, __ATOMIC_RELAXED);
+    out[2] = __atomic_load_n(&ar_engram_failures, __ATOMIC_RELAXED);
+    out[3] = __atomic_load_n(&ar_engram_rows_read, __ATOMIC_RELAXED);
+}
 uint64_t ar_engram_bytes_snapshot(void) {
     return __atomic_load_n(&ar_engram_bytes,__ATOMIC_RELAXED);
 }
@@ -96,6 +139,15 @@ bool ds4_engram_table_open(ds4_engram_table *t, const char *path,
                            uint64_t offset, uint32_t rows) {
     if (!t) return false;
     ar_engram_accounting = getenv("DS4_ARGODRIVE_ACCOUNTING") != NULL;
+    static int diag_checked;
+    if (!diag_checked) {
+        diag_checked = 1;
+        ar_engram_diag_path = getenv("DS4_ARGODRIVE_ENGRAM_DIAGNOSTICS");
+        if (ar_engram_diag_path && *ar_engram_diag_path) {
+            ar_engram_io_rows = calloc(AR_ENGRAM_IO_CAP, sizeof(*ar_engram_io_rows));
+            if (ar_engram_io_rows) atexit(ar_engram_io_flush);
+        }
+    }
     *t = (ds4_engram_table){.fd = -1};
     uint64_t bytes = (uint64_t)rows * DS4_ENGRAM_ROW_BYTES;
     if (!path || !rows || offset > INT64_MAX || bytes > INT64_MAX - offset) {
@@ -131,18 +183,34 @@ void ds4_engram_table_close(ds4_engram_table *t) {
 
 static bool read_row(int fd, uint64_t offset, uint8_t row[DS4_ENGRAM_ROW_BYTES]) {
     size_t done = 0;
+    uint64_t calls = 0;
+    const double begin = ar_engram_io_rows ? ar_engram_now() : 0;
+    int error = 0;
     while (done < DS4_ENGRAM_ROW_BYTES) {
+        calls++;
         ssize_t n = pread(fd, row + done, DS4_ENGRAM_ROW_BYTES - done,
                           (off_t)(offset + done));
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) {
-            if (n == 0) errno = EIO;
-            return false;
+            error = n == 0 ? EIO : errno;
+            break;
         }
         if (ar_engram_accounting) __atomic_fetch_add(&ar_engram_bytes,(uint64_t)n,__ATOMIC_RELAXED);
         done += (size_t)n;
     }
-    return true;
+    if (ar_engram_accounting) {
+        __atomic_fetch_add(&ar_engram_calls, calls, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&ar_engram_failures, error != 0, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&ar_engram_rows_read, error == 0, __ATOMIC_RELAXED);
+    }
+    if (ar_engram_io_rows) {
+        double end = ar_engram_now();
+        uint64_t i = __atomic_fetch_add(&ar_engram_io_count, 1, __ATOMIC_RELAXED);
+        if (i < AR_ENGRAM_IO_CAP)
+            ar_engram_io_rows[i] = (ar_engram_io){offset, done, calls, begin, end, error};
+    }
+    if (error) errno = error;
+    return error == 0;
 }
 
 static float e4m3(uint8_t byte) {
