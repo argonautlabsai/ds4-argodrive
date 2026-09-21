@@ -40,7 +40,7 @@ def main():
     for name in ('engine', 'model', 'prompt', 'out'):
         a.add_argument('--'+name, required=True, type=Path)
     a.add_argument('--variant', choices=['upstream', 'fork'], required=True)
-    a.add_argument('--profile', choices=['legacy', 'champion-20260919', 'champion-20260921'], default='legacy')
+    a.add_argument('--profile', choices=['legacy', 'champion-20260919', 'champion-20260921', 'v41-router-20260921'], default='legacy')
     a.add_argument('--replica', action='append', default=[], type=Path)
     a.add_argument('--receipt', type=Path)
     a.add_argument('--prompt-tokens', choices=[512, 2048], type=int, default=512)

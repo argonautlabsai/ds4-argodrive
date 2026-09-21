@@ -21,6 +21,19 @@ DS41_LOCAL_BENCHMARK = {
 
 def ds41_fork_profile(model_path, replica_paths, profile='legacy'):
     """Export a reviewable configuration; this is not engine capability detection."""
+    if profile == 'v41-router-20260921':
+        previous = ds41_fork_profile(model_path, replica_paths, 'champion-20260921')
+        previous['environment'].update({
+            'DS4_ARGODRIVE_HC_EXPAND_BF16': '1',
+            'DS4_ARGODRIVE_ROPE_INPUT': '1',
+            'DS4_ARGODRIVE_QAKV_BF16': '1',
+            'DS4_ARGODRIVE_Q8_ROWS_EPILOGUE': '1',
+            'DS4_ARGODRIVE_VIEW_CACHE': '1',
+            'DS4_ARGODRIVE_V41_ROUTER_FUSION': '4',
+        })
+        return {**previous, 'id': profile, 'status': 'Pinned V4.1 router experiment',
+                'engine_commit': 'a53dab7bdd435b41974371a393e7eb883fa9774b',
+                'scope': 'Opt-in three-drive V4.1 router and fusion profile; retain measured steady and inclusive rates separately.'}
     if profile == 'champion-20260921':
         previous = ds41_fork_profile(model_path, replica_paths, 'champion-20260919')
         previous['environment'].update({
