@@ -37,5 +37,28 @@
     "CUDA hardware",
     "Distributed inference hardware",
     "AddressSanitizer on this candidate"
-  ]
+  ],
+  "resumed_performance_qualification": {
+    "release": "v41-router-qualified-20260921",
+    "groups": [
+      "final200",
+      "router-clean512",
+      "router-clean-alternate"
+    ],
+    "recorded_arms": 20,
+    "qualified_arms": 10,
+    "excluded_arms": 10,
+    "tg512_repeats_per_configuration": 2,
+    "alternate_repeats_per_configuration": 1,
+    "scope": "Output identity, requested cache, no swap growth, GPU clocks and byte accounting passed. Broad model quality and chat/server performance remain unqualified. Engine source and profile unchanged."
+  },
+  "qualification_publication_checks": {
+    "published_evidence_verifier": "PASS: 20 CSVs, prompt/runtime/reference hashes, medians, accounting, exclusions and 75 source hashes",
+    "python_tests": "PASS: 27",
+    "focused_metal_and_reader_fixtures": "PASS: thirteen, including router with two buffer offsets",
+    "chart": "SVG and PNG regenerated from the qualified 512-token group and visually inspected",
+    "new_files_privacy_scan": "PASS: private paths, local network addresses, personal email, credentials and session references not found",
+    "original_evidence": "Original 14 arm records and timing CSVs preserved; alternate prompt description clarified",
+    "engine_changes": "None"
+  }
 }

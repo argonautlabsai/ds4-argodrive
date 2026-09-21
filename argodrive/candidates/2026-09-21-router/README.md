@@ -1,31 +1,44 @@
-# V4.1 router candidate — September 21
+# V4.1 router — completed performance qualification, September 21
 
-**20.105 steady tok/s at pp512/tg200**, measured on an M5 Max with 128 GiB,
-internal SSD and two Thunderbolt 5 NVMe enclosures. The generation-inclusive
-median is **19.445 tok/s**. This candidate passed the 200-token matched repeat;
-**512-token and alternate-prompt performance qualification remain pending**.
+**20.115 generation-inclusive tok/s at pp512/tg512**, with a steady median of
+**20.375 tok/s**, on an M5 Max with 128 GiB, internal SSD and two Thunderbolt 5
+NVMe enclosures. The resumed 512-token BAAB passed, as did one alternate-prompt
+pair. Release: `v41-router-qualified-20260921`; profile: `v41-router-20260921`.
+Engine source and settings are unchanged from the original candidate.
 
-![Matched 200-token steady and inclusive results](comparison.svg)
+![Matched 512-token steady and inclusive results](comparison.svg)
 
-| Metric | Published champion, rerun | Router candidate | Change |
-|---|---:|---:|---:|
-| Steady tok/s, median | 19.665 | **20.105** | **+2.24%** |
-| Steady tok/s, range | 19.64–19.69 | 20.06–20.15 | |
-| Generation-inclusive tok/s, median | 19.075 | **19.445** | **+1.94%** |
-| First decode step, median | 360.968 ms | 384.384 ms | +6.49% time |
-| Prompt processing, median | 45.185 tok/s | 44.900 tok/s | −0.63% speed |
+| Prompt / output tokens | Order | Previous champion steady | Router steady | Steady gain | Router inclusive |
+|---|---|---:|---:|---:|---:|
+| Main / 200 | ABBA | 19.665 | **20.105** | +2.24% | **19.445** |
+| Main / 512 | BAAB | 19.830 | **20.375** | +2.75% | **20.115** |
+| Alternate / 200 | AB, one pair | 15.940 | **16.240** | +1.88% | **15.780** |
 
-Four runs in ABBA order, two per configuration. All use the same 512-token raw
-completion prompt, 200 generated tokens, 4,096 context allocation and 4,200
-cached experts. Output SHA-256, cache misses and allocation matched; swap growth
-was zero and measured decode GPU frequency was 1,620 MHz on every run.
+Each main-prompt group has two runs per configuration. The alternate result is
+one pair, not a repeated qualification. All prompts use 512 tokens, with 4,096
+context allocation and 4,200 cached experts. The main prompt is the opening of
+*I Promessi Sposi*. The [alternate file](../../reproduce/prompts/alternate.txt)
+is a synthetic benchmark passage with an appended fictional CFO question;
+only its first 512 model tokens are consumed as raw completion input. Its prose
+is benchmark input, not a description of the actual test settings.
+
+The 512-token router runs were **20.40 / 20.35 steady** and **20.14 / 20.09
+inclusive**; control runs were **19.85 / 19.81 steady** and **19.58 / 19.57
+inclusive**. The inclusive improvement is **2.76%**. All ten included arms match
+their prompt's reference output, retain the full cache, have zero swap growth
+and hold 1,620 MHz active decode GPU clocks. Existing swap was not zero.
 
 Steady excludes the first decode step; inclusive includes it. Both exclude
 startup and prefill. The first token is produced by prefill; the first decode
 step is a separate operation. Two repeats give an observed range, not a
-confidence interval. This comparison reruns our published champion, **not
-upstream ds4**. It does not establish a universal hardware record or broad
-model-quality validation.
+confidence interval. This compares our previous champion, **not upstream ds4**.
+It does not establish a universal 20 tok/s result, broad model-quality
+validation or chat/server performance. Keepalive increases power consumption.
+
+At pp512/tg512, median engine-launch-to-first-token markers were **11.731 s**
+for the control and **11.731 s** for the router. Median prefill rates were
+44.955 and 44.930 tok/s respectively. These engine timestamps are not
+client-observed TTFT; the decode improvement is not a first-response claim.
 
 ## Implementation and profile
 
@@ -48,38 +61,41 @@ requested length or benchmark timer boundary was changed.
 
 ## All attempts are retained
 
-[Fourteen timing CSVs](arms/) · [Measured results and byte accounting](results.json)
+[Twenty timing CSVs](arms/) · [Measured results and byte accounting](results.json)
 · [75 source checksums](source-sha256.json) · [Validation](validation.json)
 
-| Group | Order | Steady tok/s in order | Decode GPU MHz in order | Qualification |
+| Group | Order | Steady tok/s in order | Decode GPU MHz in order | Disposition |
 |---|---|---|---|---|
-| 200-token main prompt | ABBA | 19.64 / 20.15 / 20.06 / 19.69 | 1620 / 1620 / 1620 / 1620 | passed |
-| First 512-token group | BAAB | 20.40 / 15.52 / 15.94 / 16.69 | 1620 / 916 / 961 / 985 | clock gate failed |
-| Repeated 512-token group | BAAB | 20.43 / 19.82 / 19.92 / 16.35 | 1620 / 1620 / 1620 / 951 | clock gate failed |
-| Alternate prompt, 200 tokens | AB | 15.89 / 14.59 | 1620 / 1123 | clock gate failed |
+| 200-token main prompt | ABBA | 19.64 / 20.15 / 20.06 / 19.69 | 1620 / 1620 / 1620 / 1620 | passed, two repeats each |
+| First 512-token group | BAAB | 20.40 / 15.52 / 15.94 / 16.69 | 1620 / 916 / 961 / 985 | excluded: clock gate |
+| Repeated 512-token group | BAAB | 20.43 / 19.82 / 19.92 / 16.35 | 1620 / 1620 / 1620 / 951 | excluded: clock gate |
+| Earlier alternate, 200 tokens | AB | 15.89 / 14.59 | 1620 / 1123 | excluded: clock gate |
+| Resumed 512-token main prompt | BAAB | 20.40 / 19.85 / 19.81 / 20.35 | 1620 / 1620 / 1620 / 1620 | passed, two repeats each |
+| Resumed alternate, 200 tokens | AB | 15.94 / 16.24 | 1620 / 1620 | passed, one pair only |
 
-A is the published `champion-v41-20260921` binary/profile; B is this candidate.
+A is the previous `champion-v41-20260921` binary/profile; B is the router profile.
 The clock gate requires at least 1,600 MHz and no more than 1% variation between
-arms. The repeat-range gate is 2%. The first failed 512-token group triggered a
-repeat with an automatic clock guard; the guard stopped after the last arm's
-clock failure. Both entire 512-token groups and the alternate group are excluded
-from speed-gain claims. Their faster individual runs are not promoted.
+arms; repeated groups must also meet a 2% speed-range gate. Each rejected group
+remains excluded in full. Faster individual runs from those groups were not
+substituted into the resumed groups. The source and profile did not change to
+obtain the resumed results. The cause of the earlier clock changes is unestablished.
 
-Clock drops occurred on both configurations; their cause is unestablished.
-No power setting changed between these runs. The matched output, full cache,
-zero swap growth and exact expert application-counter closure checks passed on
-all fourteen arms. Physical read counters cover all three SSDs during prefill
-and decode. Their residual against instrumented application bytes is unassigned:
-other I/O and 100 ms boundary uncertainty remain. Engine first-token markers
-are recorded separately and are not client-observed TTFT.
+Physical counters cover all three SSDs in prefill and decode. Application
+counters close; physical/application residuals and sampled boundary uncertainty
+remain explicit in results.json. Residuals are unassigned, not forced to zero.
+All first-token durations are engine markers. This evidence package exports
+numeric benchmark records and generic device roles, without private paths,
+device serials, local addresses or session transcripts.
 
-The [previous champion](../../champions/2026-09-21/README.md), which passed both
-200- and 512-token repeats, remains available under its unchanged tag.
+The [original candidate release](https://github.com/argonautlabsai/ds4-argodrive/releases/tag/v41-router-20260921)
+and [previous champion](../../champions/2026-09-21/README.md) remain available
+under unchanged tags. The new tag records completion of the pending performance
+gates; the software remains an experimental prerelease.
 
 ## Build and reproduce
 
 ```sh
-git clone --branch v41-router-20260921 https://github.com/argonautlabsai/ds4-argodrive.git
+git clone --branch v41-router-qualified-20260921 https://github.com/argonautlabsai/ds4-argodrive.git
 cd ds4-argodrive
 export DEVELOPER_DIR=/Library/Developer/CommandLineTools
 export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"

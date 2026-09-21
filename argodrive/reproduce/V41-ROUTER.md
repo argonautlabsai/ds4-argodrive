@@ -5,8 +5,12 @@ with a V4.1 router fast path and a small fusion stack. Select it explicitly;
 the existing profiles and engine defaults are unchanged.
 
 The [matched results and all attempts](../candidates/2026-09-21-router/README.md)
-record 20.105 steady / 19.445 inclusive tok/s at pp512/tg200. The longer repeat
-has not qualified because GPU clocks varied between arms.
+record 20.375 steady / 20.115 generation-inclusive tok/s at pp512/tg512,
+with two runs per configuration in BAAB order. The resumed alternate-prompt
+check passed as one pair (16.24 steady / 15.78 inclusive); it is not a repeated
+alternate-prompt qualification. The earlier pp512/tg200 ABBA remains included.
+Use release tag `v41-router-qualified-20260921`; the profile name remains
+`v41-router-20260921` and its settings are unchanged.
 
 The engine source revision is `a53dab7bdd435b41974371a393e7eb883fa9774b`.
 The profile adds exactly these settings:
@@ -49,7 +53,7 @@ python3 argodrive/reproduce/run.py run \
   --replica /path/to/enclosure-2/DeepSeek-V4.1-Flash-Q4.gguf \
   --receipt /path/to/your-receipt.json \
   --prompt "$PWD/speed-bench/promessi_sposi.txt" \
-  --prompt-tokens 512 --tokens 200 --accounting --timeline \
+  --prompt-tokens 512 --tokens 512 --accounting --timeline \
   --sampler /path/to/argodrive-phase-sampler --out /path/to/new-arm
 ```
 
@@ -57,6 +61,10 @@ The inherited setup is 4,200 cached experts, nine persistent read threads,
 prefill split 10:5:5, decode split 10:6:6 and 32-token cache decay. Engram remains
 on the internal drive with eight asynchronous readers. Keepalive remains enabled
 and increases power use. Use `plan` to review the command without inference.
+
+For the main-prompt comparison, run the router, control, control, router (BAAB),
+using a new output directory for every arm. The alternate raw-completion prompt is
+`argodrive/reproduce/prompts/alternate.txt`; use `--tokens 200` for that pair.
 
 Use a separate build of `champion-v41-20260921` as the control. Compare the same
 prompt, generated length, cache allocation, sampling and power conditions.

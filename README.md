@@ -1,30 +1,29 @@
 # DS4 Argodrive — DeepSeek V4.1 on three SSDs
 
-**New router candidate: 20.105 steady tok/s at 200 generated tokens, +2.24% against our published champion in a matched rerun.** Generation-inclusive median: **19.445 tok/s**. DeepSeek V4.1 Flash Q4 (518.6 GB), M5 Max with 128 GiB, internal SSD plus two Thunderbolt 5 NVMe enclosures; 512-token prompt.
+**20.115 generation-inclusive tok/s at 512 generated tokens; 20.375 steady tok/s.** DeepSeek V4.1 Flash Q4 (518.6 GB), M5 Max with 128 GiB, internal SSD plus two Thunderbolt 5 NVMe enclosures; 512-token prompt. The completed BAAB qualification has two runs per configuration, byte-identical reference outputs, the full 4,200-expert cache, zero swap growth and matched GPU clocks.
 
-**The 200-token repeat passed. Longer-run qualification remains pending because GPU clocks changed during the 512-token and alternate-prompt comparisons.** The previous qualified champion remains available under its unchanged tag.
+![Matched 512-token steady and inclusive results](argodrive/candidates/2026-09-21-router/comparison.svg)
 
-![Matched 200-token steady and inclusive results](argodrive/candidates/2026-09-21-router/comparison.svg)
-
-| Metric, pp512/tg200 | Published champion, matched rerun | Router candidate | Gain |
+| Metric, pp512/tg512 | Previous champion, matched rerun | Qualified router profile | Gain |
 |---|---:|---:|---:|
-| Steady tok/s, median | 19.665 | **20.105** | **+2.24%** |
-| Including first decode step, median | 19.075 | **19.445** | **+1.94%** |
+| Including first decode step, median | 19.575 | **20.115** | **+2.76%** |
+| Steady tok/s, median | 19.830 | **20.375** | **+2.75%** |
+| Including first decode step, range | 19.57–19.58 | **20.09–20.14** | |
 
-Four interleaved runs in ABBA order: matching reference outputs, full 4,200-expert cache, zero swap growth and stable measured GPU clocks. Steady excludes the first decode step; inclusive includes it. Both exclude startup and prefill. Upstream ds4 was not rerun in this campaign. All ten clock-affected longer/alternate attempts are retained and excluded from speed-gain claims.
+Both decode metrics exclude startup and prefill; steady also excludes the first decode step. The separate alternate-prompt check reached **15.78 inclusive / 16.24 steady tok/s**, with one matched pair only. The 20 tok/s result is workload-specific. This compares against our previous Argodrive champion, not current upstream ds4, and does not establish broad model-quality or chat/server performance. All ten earlier clock-affected attempts remain excluded and available alongside the ten passing arms.
 
-[**Candidate release**](https://github.com/argonautlabsai/ds4-argodrive/releases/tag/v41-router-20260921) · [**Results, all 14 CSVs and validation**](argodrive/candidates/2026-09-21-router/README.md) · [**Reproduce the candidate**](argodrive/reproduce/V41-ROUTER.md#run) · [**Machine-readable evidence**](argodrive/candidates/2026-09-21-router/results.json)
+[**Qualified results release**](https://github.com/argonautlabsai/ds4-argodrive/releases/tag/v41-router-qualified-20260921) · [**Results, all 20 CSVs and validation**](argodrive/candidates/2026-09-21-router/README.md) · [**Reproduce the result**](argodrive/reproduce/V41-ROUTER.md#run) · [**Machine-readable evidence**](argodrive/candidates/2026-09-21-router/results.json)
 
-The [qualified September 21 champion](argodrive/champions/2026-09-21/README.md) recorded **19.580 steady / 19.030 inclusive** at 200 generated tokens and **19.905 steady / 19.670 inclusive** at 512, with two matched repeats per configuration and length. Its [release and restore tag](https://github.com/argonautlabsai/ds4-argodrive/releases/tag/champion-v41-20260921) are unchanged. These historical figures are separate from the fresh control above.
+The earlier pp512/tg200 repeat remains **20.105 steady / 19.445 inclusive tok/s**. The original candidate and [previous champion](argodrive/champions/2026-09-21/README.md) tags are preserved. The new tag publishes the completed qualification with unchanged engine source and profile; it remains an experimental prerelease.
 
-This experimental fork builds on [ds4 by Salvatore Sanfilippo (antirez) and contributors](https://github.com/antirez/ds4). The reader, scheduling changes and Metal kernels are included in this repository; no private provider is required. Original licences, acknowledgements and [credits](CREDITS.md) are preserved. Development and review used Claude, ChatGPT and OpenAI Codex.
+This fork builds on [ds4 by Salvatore Sanfilippo (antirez) and contributors](https://github.com/antirez/ds4). The reader, scheduling changes and Metal kernels are included in this repository; no private provider is required. Original licences, acknowledgements and [credits](CREDITS.md) are preserved. Development and review used Claude, ChatGPT and OpenAI Codex.
 
-Select `v41-router-20260921` for this candidate; use the [previous champion recipe](argodrive/champions/2026-09-21/README.md#build-and-reproduce) for the qualified profile. The candidate adds the 384-expert SIMD router and small fusion stack to resident-expert compute overlap, persistent split-read dispatch, rounding-preserving kernel fusions, cache scanning and tuned keepalive. Prefill reads split **10:5:5**, decode **10:6:6**; Engram stays asynchronous on the primary SSD. Keepalive consumes additional power and can lose performance under competing GPU work. This one-prompt experiment is not broad model-quality validation or a universal speed guarantee.
+Build release tag `v41-router-qualified-20260921` and select profile `v41-router-20260921`. The profile combines the 384-expert SIMD router and small fusion stack with resident-expert compute overlap, persistent split-read dispatch, rounding-preserving kernel fusions, cache scanning and tuned keepalive. Prefill reads split **10:5:5**, decode **10:6:6**; Engram stays asynchronous on the primary SSD. Keepalive consumes additional power and can lose performance under competing GPU work. Existing engine defaults are unchanged.
 
 ## Build and test
 
 ```sh
-git clone --branch v41-router-20260921 https://github.com/argonautlabsai/ds4-argodrive.git
+git clone --branch v41-router-qualified-20260921 https://github.com/argonautlabsai/ds4-argodrive.git
 cd ds4-argodrive
 export DEVELOPER_DIR=/Library/Developer/CommandLineTools
 export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
@@ -33,7 +32,7 @@ make -j4 CC="$(xcrun --find clang)" ds4 ds4-bench ds4-server
 python3 argodrive/candidates/2026-09-21-router/verify-results.py
 ```
 
-The measured toolchain was Apple clang 14.0.3 / macOS 26.4 SDK. Verify your installed versions and follow the [full candidate run command](argodrive/reproduce/V41-ROUTER.md#run) with three verified model copies. Model files are separate. The [candidate validation record](argodrive/candidates/2026-09-21-router/validation.json) lists passed checks and untested configurations.
+The measured toolchain was Apple clang 14.0.3 / macOS 26.4 SDK. Verify your installed versions and follow the [full profile run command](argodrive/reproduce/V41-ROUTER.md#run) with three verified model copies. Model files are separate. The [validation record](argodrive/candidates/2026-09-21-router/validation.json) lists passed checks and untested configurations.
 
 ## Inspect your storage with Argodrive
 
