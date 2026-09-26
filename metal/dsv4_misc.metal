@@ -6868,6 +6868,29 @@ kernel void kernel_dsv4_tp_keepalive(
     out[tid] = a;
 }
 
+// Argodrive 2026-09-26 (ARGODRIVE_KEEPALIVE_MEM): memory-streaming keep-alive.
+// Same role as the ALU spinner above, but its load is DRAM traffic: every
+// thread streams coalesced float4 loads over a buffer larger than the system
+// level cache, walking forward from `base` (rotated by the host per dispatch),
+// so the memory side of the SoC sees continuous demand during the CPU waits,
+// not only the shader cores. Opt-in via DS4_ARGODRIVE_KEEPALIVE_MEM_MB.
+kernel void kernel_dsv4_tp_keepalive_mem(
+        device const float4 * src,
+        device float * out,
+        constant uint & iters,
+        constant uint & mask,
+        constant uint & base,
+        uint tid [[thread_position_in_grid]],
+        uint n [[threads_per_grid]]) {
+    float4 acc = float4(out[tid]);
+    uint idx = base + tid;
+    for (uint i = 0; i < iters; i++) {
+        acc += src[idx & mask];
+        idx += n;
+    }
+    out[tid] = acc.x + acc.y + acc.z + acc.w;
+}
+
 // Tensor-parallel gate flag: publishes a sequence number to a slab slot the
 // CPU service thread spin-reads, replacing the much slower shared-event
 // signal for the GPU->CPU direction.  Ordering against the partial-output

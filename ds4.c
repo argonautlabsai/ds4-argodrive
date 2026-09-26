@@ -41033,6 +41033,17 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     bool engram_prefetched = overlap_engram &&
         ds41_engram_prefetch_start(&engram_prefetch, g, 0, total_count);
     bool ok = !g->streaming || metal_graph_stream_map_token(m, w);
+    /* Argodrive 2026-09-26 (ARGODRIVE_STATIC_EARLY): with DS4_ARGODRIVE_STATIC_EARLY=1 the
+     * decode-static views are installed before the sweep as well. Per-layer sweep
+     * mappings then find their spans covered and keep the views, so the driver's
+     * first-use validation of the static set lands inside the disk-bound sweep and
+     * the first decode token no longer pays it. The post-sweep install stays (a
+     * no-op when the views survived). */
+    if (ok && g->streaming) {
+        const char *ar_static_early = getenv("DS4_ARGODRIVE_STATIC_EARLY");
+        if (ar_static_early && strcmp(ar_static_early, "0") != 0 &&
+            !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
+    }
     metal_graph_stream_prepare_slot prepare = {0};
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (cancel && cancel(cancel_ud)) { ok = false; break; }

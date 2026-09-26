@@ -209,6 +209,10 @@ def run(p, timeout=1800, replicas=(), verification_receipt=None, primary_weight=
                     'DS4_ARGODRIVE_HC_EXPAND_BF16', 'DS4_ARGODRIVE_ROPE_INPUT',
                     'DS4_ARGODRIVE_QAKV_BF16', 'DS4_ARGODRIVE_Q8_ROWS_EPILOGUE',
                     'DS4_ARGODRIVE_VIEW_CACHE', 'DS4_ARGODRIVE_V41_ROUTER_FUSION'})
+    # Argodrive 2026-09-26 speed campaign: opt-in keep-alive variants, pipeline pre-warm, per-read trace.
+    allowed.update({'DS4_ARGODRIVE_READ_TIMING', 'DS4_ARGODRIVE_KEEPALIVE_MEM_MB', 'DS4_ARGODRIVE_KEEPALIVE_MEM_ITERS',
+                    'DS4_ARGODRIVE_CPU_KEEPALIVE_MEM_MB', 'DS4_ARGODRIVE_PSO_PREWARM', 'DS4_ARGODRIVE_ENGRAM_DIAGNOSTICS',
+                    'DS4_METAL_STREAMING_EXPERT_PREAD_PROFILE', 'DS4_ARGODRIVE_QOS', 'DS4_ARGODRIVE_PREFILL_RELEASE', 'DS4_METAL_Q8_MV_NR0', 'DS4_METAL_Q8_MV_NSG', 'DS4_ARGODRIVE_STATIC_EARLY', 'DS4_METAL_CB_TIMES', 'DS4_ARGODRIVE_SLAB_WARM'})
     if any(k not in allowed or not isinstance(v, str) or '\0' in v
            for k, v in experimental_env.items()):
         raise ValueError('Unsupported experimental environment setting.')

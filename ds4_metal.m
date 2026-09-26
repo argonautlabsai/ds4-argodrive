@@ -5556,6 +5556,26 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
     };
 }
 
+/* ARGODRIVE_Q8_ROWS (2026-09-26): DS4_METAL_Q8_MV_NR0=2|4|8 (default 2) selects the
+ * 4- or 8-rows-per-threadgroup twins of the plain and bf16-rounded Q8_0 decode
+ * matvecs. The twins keep the per-row K walk and reduction tree, so the stored
+ * values are bit-identical; only the threadgroup count and shared memory change.
+ * Applied only where those two kernels are dispatched by name. */
+static void ds4_gpu_q8_0_mv_dispatch_wide(ds4_gpu_mv_dispatch *d, uint64_t out_dim) {
+    static int nr0 = -1;
+    if (nr0 < 0) nr0 = (int)ds4_gpu_env_u64("DS4_METAL_Q8_MV_NR0", 2u, 2u, 8u);
+    if (nr0 <= 2 || !d || !d->function_name) return;
+    const int plain = strcmp(d->function_name, "kernel_mul_mv_q8_0_f32") == 0;
+    const int bf16 = strcmp(d->function_name, "kernel_mul_mv_q8_0_bf16_f32") == 0;
+    if (!plain && !bf16) return;
+    const int w = nr0 >= 8 ? 8 : 4;
+    if (out_dim % (uint64_t)w) return;
+    d->function_name = plain ? (w == 8 ? "kernel_mul_mv_q8_0_f32_r8" : "kernel_mul_mv_q8_0_f32_r4")
+                             : (w == 8 ? "kernel_mul_mv_q8_0_bf16_f32_r8" : "kernel_mul_mv_q8_0_bf16_f32_r4");
+    d->nr0 = w;
+    d->smem = 32u * (NSUInteger)w * sizeof(float);
+}
+
 static ds4_gpu_mv_dispatch ds4_gpu_make_plain_mv_dispatch(
         uint64_t in_dim,
         int      f32_weights) {
@@ -7078,6 +7098,30 @@ int ds4_gpu_init(void) {
             return 0;
         }
         g_library = library;
+
+        /* Argodrive 2026-09-26 (ARGODRIVE_PSO_PREWARM): DS4_ARGODRIVE_PSO_PREWARM=1 builds
+         * every compute pipeline state at load time instead of lazily on first use.
+         * The first decode token otherwise pays the creation of every kernel prefill
+         * never ran (measured 535 ms first decode step against 49 ms steady). Load-time
+         * work only; no kernel, buffer or numeric path changes. */
+        if (getenv("DS4_ARGODRIVE_PSO_PREWARM") && strcmp(getenv("DS4_ARGODRIVE_PSO_PREWARM"), "0") != 0) {
+            const double prewarm_t0 = ds4_gpu_now_ms();
+            unsigned prewarm_built = 0, prewarm_failed = 0;
+            for (NSString *prewarm_name in [library functionNames]) {
+                @autoreleasepool {
+                    id<MTLFunction> prewarm_fn = [library newFunctionWithName:prewarm_name];
+                    if (!prewarm_fn || prewarm_fn.functionType != MTLFunctionTypeKernel ||
+                        [prewarm_fn.functionConstantsDictionary count] != 0) continue; /* specialised elsewhere */
+                    NSError *prewarm_error = nil;
+                    id<MTLComputePipelineState> prewarm_pso =
+                        [g_device newComputePipelineStateWithFunction:prewarm_fn error:&prewarm_error];
+                    if (prewarm_pso) { [g_pipeline_cache setObject:prewarm_pso forKey:prewarm_name]; prewarm_built++; }
+                    else prewarm_failed++;
+                }
+            }
+            fprintf(stderr, "ds4: Argodrive PSO prewarm: %u pipelines built, %u failed, %.0f ms\n",
+                    prewarm_built, prewarm_failed, ds4_gpu_now_ms() - prewarm_t0);
+        }
 
         id<MTLFunction> fn = [library newFunctionWithName:@"kernel_get_rows_f32"];
         if (!fn) {
@@ -10665,12 +10709,33 @@ static void *ds4_gpu_tp_keepalive_thread(void *arg) {
      * (~1.7x) suggest decode runs well below max clocks. More TGs raise
      * apparent utilization without eating memory bandwidth. */
     uint32_t ka_tgs = ds4_gpu_tp_keepalive_tgs_from_env();
+    /* Argodrive 2026-09-26 (ARGODRIVE_KEEPALIVE_MEM_HOST): DS4_ARGODRIVE_KEEPALIVE_MEM_MB=N
+     * swaps the ALU spinner for kernel_dsv4_tp_keepalive_mem streaming an N MiB
+     * buffer (rounded up to a power of two of float4s); DS4_ARGODRIVE_KEEPALIVE_MEM_ITERS
+     * float4 loads per thread per dispatch (default 2048: 1 threadgroup moves 8 MiB
+     * per dispatch, so a dispatch still ends within a fraction of a millisecond). */
+    const char *mem_env = getenv("DS4_ARGODRIVE_KEEPALIVE_MEM_MB");
+    const uint32_t mem_mb = mem_env ? (uint32_t)atoi(mem_env) : 0;
+    uint32_t mem_iters = 2048;
+    if (getenv("DS4_ARGODRIVE_KEEPALIVE_MEM_ITERS")) mem_iters = (uint32_t)atoi(getenv("DS4_ARGODRIVE_KEEPALIVE_MEM_ITERS"));
+    if (mem_iters == 0) mem_iters = 1;
+    id<MTLBuffer> mem_buffer = nil;
+    uint32_t mem_mask = 0, mem_base = 0;
+    if (mem_mb > 0 && mem_mb <= 4096) {
+        uint64_t f4 = ((uint64_t)mem_mb << 20) / 16u, pow2 = 1;
+        while (pow2 < f4) pow2 <<= 1;
+        mem_buffer = [g_device newBufferWithLength:(NSUInteger)(pow2 * 16u) options:MTLResourceStorageModeShared];
+        if (mem_buffer) { memset(mem_buffer.contents, 0, mem_buffer.length); mem_mask = (uint32_t)(pow2 - 1); }
+    }
     id<MTLComputePipelineState> pipeline =
-        ds4_gpu_get_pipeline("kernel_dsv4_tp_keepalive");
+        ds4_gpu_get_pipeline(mem_buffer ? "kernel_dsv4_tp_keepalive_mem" : "kernel_dsv4_tp_keepalive");
     if (!pipeline) {
         fprintf(stderr, "ds4: TP keep-alive pipeline missing\n");
         return NULL;
     }
+    if (mem_buffer)
+        fprintf(stderr, "ds4: Argodrive keep-alive streams %lu MiB per pass (%u float4 loads/thread/dispatch)\n",
+                (unsigned long)(mem_buffer.length >> 20), mem_iters);
     while (!g_tp_shutdown && (!g_ar_keepalive_owned ||
            !__atomic_load_n(&g_ar_keepalive_stop, __ATOMIC_ACQUIRE))) {
         if (__atomic_load_n(&g_tp_keepalive_paused, __ATOMIC_ACQUIRE)) {
@@ -10681,8 +10746,17 @@ static void *ds4_gpu_tp_keepalive_thread(void *arg) {
             id<MTLCommandBuffer> cb = [g_tp_keepalive_queue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             [enc setComputePipelineState:pipeline];
-            [enc setBuffer:g_tp_keepalive_buffer offset:0 atIndex:0];
-            [enc setBytes:&iters length:sizeof(iters) atIndex:1];
+            if (mem_buffer) { /* ARGODRIVE_KEEPALIVE_MEM_ENCODE */
+                [enc setBuffer:mem_buffer offset:0 atIndex:0];
+                [enc setBuffer:g_tp_keepalive_buffer offset:0 atIndex:1];
+                [enc setBytes:&mem_iters length:sizeof(mem_iters) atIndex:2];
+                [enc setBytes:&mem_mask length:sizeof(mem_mask) atIndex:3];
+                [enc setBytes:&mem_base length:sizeof(mem_base) atIndex:4];
+                mem_base = (uint32_t)((mem_base + (uint64_t)mem_iters * ka_tgs * 256u) & mem_mask);
+            } else {
+                [enc setBuffer:g_tp_keepalive_buffer offset:0 atIndex:0];
+                [enc setBytes:&iters length:sizeof(iters) atIndex:1];
+            }
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)ka_tgs, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc endEncoding];
@@ -13066,6 +13140,30 @@ int ar_prefill_release(void) {
      * expert cache into it. */
     ar_prefill_ahead_join();
     if (!ar_prefill_clear()) return 0;
+    /* Argodrive 2026-09-26 (ARGODRIVE_PREFILL_RELEASE): DS4_ARGODRIVE_PREFILL_RELEASE=async
+     * releases the two 3-buffer staging sets (about 14 GiB of wired pages) on a
+     * background queue instead of on the decode thread; =keep leaves them
+     * allocated for the process lifetime. The first decode step measured 535 ms
+     * against 49 ms steady with the kernels themselves at normal speed. */
+    const char *policy = getenv("DS4_ARGODRIVE_PREFILL_RELEASE");
+    if (policy && strcmp(policy, "keep") == 0) {
+        fprintf(stderr, "ds4: Argodrive prefill staging pool kept resident (DS4_ARGODRIVE_PREFILL_RELEASE=keep)\n");
+        return 1;
+    }
+    if (policy && strcmp(policy, "async") == 0) {
+        NSMutableArray *held = [NSMutableArray arrayWithCapacity:6];
+        for (unsigned set=0;set<2;set++)
+            for (unsigned i=0;i<3;i++) {
+                if (ar_prefill_pool[set][i]) [held addObject:ar_prefill_pool[set][i]];
+                ar_prefill_pool[set][i]=nil; ar_prefill_pool_bytes[set][i]=0;
+            }
+        const double t0 = ds4_gpu_now_ms();
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            @autoreleasepool { [held removeAllObjects]; }
+            fprintf(stderr, "ds4: Argodrive prefill staging pool released in the background (%.0f ms after the sweep)\n", ds4_gpu_now_ms() - t0);
+        });
+        return 1;
+    }
     for (unsigned set=0;set<2;set++)
         for (unsigned i=0;i<3;i++) { ar_prefill_pool[set][i]=nil; ar_prefill_pool_bytes[set][i]=0; }
     return 1;
@@ -14114,10 +14212,30 @@ static int g_ar_cpu_keepalive_started;
 static void *ds4_gpu_argodrive_cpu_keepalive_thread(void *arg) {
     (void)arg;
     (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-    volatile double sink = 1.0;
-    while (!g_ar_cpu_keepalive_stop) {
-        for (int i = 0; i < 100000; i++) sink = sink * 1.0000001 + 0.5;
+    /* Argodrive 2026-09-26 (ARGODRIVE_CPU_KEEPALIVE_MEM): DS4_ARGODRIVE_CPU_KEEPALIVE_MEM_MB=N
+     * streams an N MiB buffer instead of spinning the ALU, so the busy core also
+     * keeps DRAM demand up between GPU command buffers. Unset or 0 keeps the spin. */
+    const char *mem_env = getenv("DS4_ARGODRIVE_CPU_KEEPALIVE_MEM_MB");
+    const size_t mem_bytes = mem_env ? ((size_t)strtoul(mem_env, NULL, 10) << 20) : 0;
+    uint64_t *mem = NULL;
+    if (mem_bytes >= ((size_t)1 << 20) && mem_bytes <= ((size_t)4 << 30)) {
+        mem = malloc(mem_bytes);
+        if (mem) memset(mem, 1, mem_bytes);
     }
+    volatile double sink = 1.0;
+    volatile uint64_t msink = 0;
+    while (!g_ar_cpu_keepalive_stop) {
+        if (mem) {
+            uint64_t s = 0;
+            const size_t n = mem_bytes / sizeof(uint64_t);
+            for (size_t i = 0; i + 8 <= n; i += 8)
+                s += mem[i] + mem[i + 1] + mem[i + 2] + mem[i + 3] + mem[i + 4] + mem[i + 5] + mem[i + 6] + mem[i + 7];
+            msink += s;
+        } else {
+            for (int i = 0; i < 100000; i++) sink = sink * 1.0000001 + 0.5;
+        }
+    }
+    free(mem);
     return NULL;
 }
 static void ds4_gpu_argodrive_cpu_keepalive_start(void) {
@@ -14129,7 +14247,8 @@ static void ds4_gpu_argodrive_cpu_keepalive_start(void) {
     if (n > 4) n = 4;
     for (int i = 0; i < n; i++)
         (void)pthread_create(&g_ar_cpu_keepalive_threads[i], NULL, ds4_gpu_argodrive_cpu_keepalive_thread, NULL);
-    fprintf(stderr, "ds4: Argodrive CPU keep-alive started (%d busy thread%s)\n", n, n == 1 ? "" : "s");
+    fprintf(stderr, "ds4: Argodrive CPU keep-alive started (%d busy thread%s%s)\n", n, n == 1 ? "" : "s",
+            getenv("DS4_ARGODRIVE_CPU_KEEPALIVE_MEM_MB") ? ", memory streaming" : ""); /* ARGODRIVE_CPU_KEEPALIVE_MEM_LOG */
 }
 static int ds4_gpu_argodrive_qos_enabled(void) {
     static int checked, on;
@@ -14622,6 +14741,40 @@ static id<MTLBuffer> ds4_gpu_stream_expert_alloc_slab_buffer(
     return buffer;
 }
 
+/* Argodrive 2026-09-26 (ARGODRIVE_SLAB_WARM): DS4_ARGODRIVE_SLAB_WARM=1 references a freshly
+ * allocated expert-cache slab from one tiny blit command buffer that is committed without
+ * waiting. Prefill fills the cache through staging buffers, so the GPU's first reference to
+ * each ~3.9 GiB slab otherwise happens in the first decode token, where the driver's mapping
+ * work showed as ~17 ms of command-buffer time per slab (about 350 ms per run). The blit
+ * copies 16 bytes from the head and tail of the slab into a scratch buffer; the data is
+ * never read back and no numeric path changes. */
+static id<MTLBuffer> g_ar_slab_warm_scratch;
+static uint32_t g_ar_slab_warm_count;
+static void ds4_gpu_stream_expert_slab_warm(id<MTLBuffer> slab, uint32_t index) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DS4_ARGODRIVE_SLAB_WARM");
+        enabled = e && strcmp(e, "0") != 0;
+    }
+    if (!enabled || !slab || !g_queue || slab.length < 32u) return;
+    @autoreleasepool {
+        if (!g_ar_slab_warm_scratch)
+            g_ar_slab_warm_scratch = [g_device newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = g_ar_slab_warm_scratch ? [g_queue commandBuffer] : nil;
+        if (!cb) return;
+        cb.label = @"Argodrive slab warm";
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        const NSUInteger dst = (NSUInteger)(index % 64u) * 64u;
+        [blit copyFromBuffer:slab sourceOffset:0 toBuffer:g_ar_slab_warm_scratch destinationOffset:dst size:16];
+        [blit copyFromBuffer:slab sourceOffset:slab.length - 16u toBuffer:g_ar_slab_warm_scratch destinationOffset:dst + 16u size:16];
+        [blit endEncoding];
+        [cb commit];
+        g_ar_slab_warm_count++;
+        if (g_ar_slab_warm_count == 1u)
+            fprintf(stderr, "ds4: Argodrive slab warm-up enabled: each expert-cache slab is referenced by the GPU at allocation\n");
+    }
+}
+
 static int ds4_gpu_stream_expert_slab_slot_range(
         uint32_t slot,
         uint32_t *slab_index,
@@ -14873,6 +15026,7 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
 
         slab = g_stream_expert_cache_slab_count++;
         g_stream_expert_cache_slabs[slab] = slab_buffer;
+        ds4_gpu_stream_expert_slab_warm(slab_buffer, slab); /* ARGODRIVE_SLAB_WARM */
         g_stream_expert_cache_slab_start_slot[slab] =
             g_stream_expert_cache_slab_total_slots;
         g_stream_expert_cache_slab_slot_count[slab] = slots;
@@ -20126,9 +20280,11 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
             ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
             if (out_dim > 65536u) mv_dispatch.nsg = 8;
+            if (round_bf16) mv_dispatch.function_name = "kernel_mul_mv_q8_0_bf16_f32";
+            ds4_gpu_q8_0_mv_dispatch_wide(&mv_dispatch, out_dim); /* ARGODRIVE_Q8_ROWS_SITE1 */
             mv_args.nr0 = mv_dispatch.nr0;
             id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_pipeline(round_bf16 ? "kernel_mul_mv_q8_0_bf16_f32" : mv_dispatch.function_name, mv_dispatch.nsg);
+                ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
             if (!pipeline) return 0;
 
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
@@ -20876,6 +21032,7 @@ int ds4_gpu_matmul_q8_0_rows_scalar_tensor(
         ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
         if (out_dim > 65536u) mv_dispatch.nsg = 8;
+        ds4_gpu_q8_0_mv_dispatch_wide(&mv_dispatch, out_dim); /* ARGODRIVE_Q8_ROWS_SITE2 */
         mv_args.nr0 = mv_dispatch.nr0;
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
@@ -27281,6 +27438,8 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
         uint32_t fold_slot = 0, fold_value = 0;
         const int fold = !owned &&
             ds4_gpu_tp_flag_fold_take(out, out_dim * sizeof(float), &fold_slot, &fold_value);
+        if (!fold) ds4_gpu_q8_0_mv_dispatch_wide(&mv_dispatch, out_dim); /* ARGODRIVE_Q8_ROWS_SITE3 */
+        mv_args.nr0 = mv_dispatch.nr0;
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_mul_mv_pipeline(
                 fold ? "kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked"

@@ -217,6 +217,29 @@ kernel void kernel_mul_mv_q8_0_bf16_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// ARGODRIVE_Q8_ROWS (2026-09-26): the same two matvecs with 4 or 8 rows per
+// threadgroup, for the wide (5120-row) decode projections that otherwise run as
+// 2560 threadgroups of trivial work. Per-row K walk and reduction tree are the
+// template's, so the stored values are bit-identical to the 2-row kernels.
+#define DS4_Q8_ROWS_KERNEL(NAME, NR, ROUND) \
+[[host_name(#NAME)]] \
+kernel void NAME( \
+        constant ds4_metal_args_mul_mv & args, \
+        device const char * src0, \
+        device const char * src1, \
+        device       char * dst, \
+        threadgroup  char * shmem [[threadgroup(0)]], \
+        uint3  tgpig[[threadgroup_position_in_grid]], \
+        ushort tiisg[[thread_index_in_simdgroup]], \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+    kernel_mul_mv_q8_0_f32_impl<NR, constant ds4_metal_args_mul_mv &, ROUND>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); \
+}
+DS4_Q8_ROWS_KERNEL(kernel_mul_mv_q8_0_f32_r4, 4, false)
+DS4_Q8_ROWS_KERNEL(kernel_mul_mv_q8_0_f32_r8, 8, false)
+DS4_Q8_ROWS_KERNEL(kernel_mul_mv_q8_0_bf16_f32_r4, 4, true)
+DS4_Q8_ROWS_KERNEL(kernel_mul_mv_q8_0_bf16_f32_r8, 8, true)
+#undef DS4_Q8_ROWS_KERNEL
+
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
 // K walk and reduction tree as kernel_mul_mv_q8_0_f32_impl, plus the checked
 // poll-gate flag published by the last-arriving threadgroup (see
