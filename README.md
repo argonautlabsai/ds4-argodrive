@@ -14,6 +14,22 @@ Against the published 21 September medians (20.375 steady / 20.115 inclusive) th
 
 [**Qualified results release**](https://github.com/argonautlabsai/ds4-argodrive/releases/tag/v41-stack-20260927) · [**Results, all 35 CSVs and validation**](argodrive/candidates/2026-09-27-stack/README.md) · [**Reproduce the result**](argodrive/reproduce/V41-STACK.md#run) · [**Machine-readable evidence**](argodrive/candidates/2026-09-27-stack/results.json)
 
+**Against pinned upstream ds4 on one, two and three drives** (27 September, one interleaved session, 512-token prompt, 200 generated; upstream median of 6 arms, fork rungs median of two):
+
+| | prompt processing tok/s | steady decode tok/s | incl. first step tok/s |
+|---|---:|---:|---:|
+| upstream ds4 `bd66c40`, internal SSD only, automatic cache | 17.96 | 10.18 | 9.90 |
+| this fork, internal SSD only, no replicas | **30.98** (1.72×) | **18.66** (1.83×) | 17.45 (1.76×) |
+| this fork, + one enclosure (10:5 prefill, 10:6 decode) | 36.88 (2.05×) | 21.05 (2.07×) | 19.54 (1.97×) |
+| this fork, + two enclosures (10:5:5 prefill, 10:6:6 decode) | **42.41** (2.36×) | **22.25** (2.19×) | 20.74 (2.10×) |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="argodrive/charts/ladder-dark.svg">
+  <img src="argodrive/charts/ladder.svg" alt="Prompt processing and steady decode, pinned upstream vs this fork on one, two and three drives, 27 September 2026">
+</picture>
+
+The internal-only row is software only: the same laptop, the same single SSD and the same model file as the upstream control, with no replicas. Output is byte-identical to upstream on all 12 arms. Every arm ran as a fresh process with an empty expert cache; fork arms held 1,620 MHz GPU clocks and zero swap growth. The fork rungs use profile `v41-stack-20260927` with 4,600 cached experts; upstream sizes its cache automatically (3,688). This is the pinned upstream base of this fork, not current upstream ds4. [Ladder results, all 12 CSVs and the verifier](argodrive/candidates/2026-09-27-ladder/README.md) · [machine-readable](argodrive/candidates/2026-09-27-ladder/results.json).
+
 Profile `v41-stack-20260927` is the published router profile plus three opt-in engine paths and a 4,600-expert cache (was 4,200). **Flag readback** (+6.6% alone): a mailbox kernel publishes the router's expert ids from inside the running command buffer; the CPU polls it and starts the miss reads while the shared-expert work, encoded before the commit, keeps the GPU busy. **Larger cache** (+3.0 to +3.3% alone): steady misses per token fall from 13.1 to 11.1 at 512 tokens. **Fused BF16 epilogues** (+0.5%) and a **pipeline-state cache** (+0.8%), plus an environment-lookup cache that is now the code default (+0.5%). Each lever was screened with interleaved pairs before the stack was qualified as a whole. Cache sizes above 4,600 tripped the swap guard; memory keep-alives, read-pool spinning, completion polling, Q8 row tiling and pipeline pre-warming were screened and rejected. Engine defaults are unchanged and the earlier profiles still run.
 
 This fork builds on [ds4 by Salvatore Sanfilippo (antirez) and contributors](https://github.com/antirez/ds4). The reader, scheduling changes and Metal kernels are included in this repository; no private provider is required. Original licences, acknowledgements and [credits](CREDITS.md) are preserved. Development and review used Claude, ChatGPT and OpenAI Codex.
@@ -57,12 +73,9 @@ The measured toolchain was Apple clang 14.0.3 / macOS 26.4 SDK. Verify your inst
 | this fork, + two external NVMe, GPU keep-alive, decode split 10:6:6 + CPU keep-alive (2026-09-19, default in the profile) | 45.34 (2.79×) | **18.45** (1.74×) |
 | this fork, + two external NVMe, 2026-09-27 stack: flag readback, 4,600-expert cache, fused BF16 epilogues (profile `v41-stack-20260927`) | 44.25 (2.73×) | **22.49** (2.12×) |
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="argodrive/charts/ladder-dark.svg">
-  <img src="argodrive/charts/ladder.svg" alt="Prompt processing and steady decode, upstream vs this fork on one, two and three drives, and the 27 September stack">
-</picture>
+The ladder chart at the top of this README now shows the 27 September session; the table above keeps the earlier rungs, whose multipliers chain to the 15 September upstream control.
 
-The keep-alive row: `DS4_ARGODRIVE_GAP_KEEPALIVE=1` with `DS4_TP_KEEPALIVE_TGS=8` (commit 361289f) runs a tiny ALU kernel on a second queue only while the CPU waits for expert reads, because the GPU otherwise drops into low-power states during those waits and every kernel after them runs slower. Four interleaved pairs at 512/200, all positive (+0.31, +0.65, +0.84, +0.54 tok/s), medians 17.34 → 17.93; a shorter spin (`DS4_TP_KEEPALIVE_ITERS=300000`, so the kernel stops sooner when a read lands) adds another four positive pairs, 17.80 → 18.06, output identical. Continuous spinning gains nothing. The chart above shows the 2026-09-15 rungs and the 2026-09-27 stack; the two keep-alive rows sit between them.
+The keep-alive row: `DS4_ARGODRIVE_GAP_KEEPALIVE=1` with `DS4_TP_KEEPALIVE_TGS=8` (commit 361289f) runs a tiny ALU kernel on a second queue only while the CPU waits for expert reads, because the GPU otherwise drops into low-power states during those waits and every kernel after them runs slower. Four interleaved pairs at 512/200, all positive (+0.31, +0.65, +0.84, +0.54 tok/s), medians 17.34 → 17.93; a shorter spin (`DS4_TP_KEEPALIVE_ITERS=300000`, so the kernel stops sooner when a read lands) adds another four positive pairs, 17.80 → 18.06, output identical. Continuous spinning gains nothing.
 
 The 2026-09-19 row adds two knobs found with `powermetrics`. `DS4_ARGODRIVE_DECODE_WEIGHTS=10,6,6` (commit 743616f) gives decode its own split across the three drives while prefill keeps 10:5:5: at 10:5:5 the internal SSD was the last drive to land on two thirds of the decode reads, at 10:6:6 on four tenths, and 10:7:7 overshoots. `DS4_ARGODRIVE_CPU_KEEPALIVE=1` (commit d04ca6a) starts one busy thread at user-interactive QoS when decode begins: the engine's threads spend most of each token waiting, the performance cores sit at their 1344 MHz floor, and the one thread that does the per-layer bookkeeping ran at 3.4 GHz; with a busy neighbour its cluster holds 4.2 GHz. The stack against the 09-17 champion, four interleaved pairs at 512/200: +0.53, +0.56, +0.62, +0.69 tok/s, medians 17.84 → 18.45, output SHA identical on all eight arms, prefill unchanged, about 4.5 W more CPU power. The champion configuration measured 17.8-17.9 that night against 18.06 two days earlier, inside the ±2% floor of this workload.
 
