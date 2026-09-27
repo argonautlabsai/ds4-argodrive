@@ -7178,6 +7178,28 @@ kernel void kernel_argodrive_v41_router_weights(
 
 // V4.1's 384-expert, six-selection decode router. Keep the reference's
 // 512-wide bitonic comparison network, including its tie and padding rules.
+// ARGODRIVE_FLAG_READBACK (2026-09-27): publish the router's expert ids to a CPU-polled mailbox
+// from inside the running command buffer: ids, then an integer checksum, then the sequence word.
+// The CPU accepts the record only when the sequence matches and the checksum agrees, so a
+// partially visible line is retried, never consumed.
+kernel void kernel_argodrive_ids_publish(
+        device const int * ids,
+        device atomic_uint * box,
+        constant uint & seq,
+        constant uint & n,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid != 0) return;
+    uint sum = 0x9e3779b9u ^ seq;
+    for (uint i = 0; i < n && i < 8u; i++) {
+        const uint v = (uint)ids[i];
+        atomic_store_explicit(&box[2u + i], v, memory_order_relaxed);
+        sum = (sum ^ v) * 0x01000193u;
+    }
+    atomic_store_explicit(&box[1], sum, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_device);
+    atomic_store_explicit(&box[0], seq, memory_order_relaxed);
+}
+
 kernel void kernel_argodrive_v41_router_select_simd(
         constant uint &has_bias, device const float4 *logits,
         device const float *bias, device float *probs, device int *selected,

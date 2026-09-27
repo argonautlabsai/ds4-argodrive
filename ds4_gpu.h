@@ -2582,6 +2582,8 @@ int ds4_gpu_swiglu_tensor(
 
 int ds4_gpu_add_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n); /* ARGODRIVE_BF16_EPILOGUES */
 void ds4_gpu_argodrive_attn_low_round(int on);
+int ds4_gpu_argodrive_flag_readback_begin(const ds4_gpu_tensor *selected, uint32_t n_selected); /* ARGODRIVE_FLAG_READBACK */
+int ds4_gpu_argodrive_flag_readback_finish(const struct ds4_gpu_stream_expert_table *table, const ds4_gpu_tensor *selected, uint32_t n_selected);
 int ds4_gpu_add_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *a,

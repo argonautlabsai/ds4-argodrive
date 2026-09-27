@@ -18442,6 +18442,75 @@ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
     return ok;
 }
 
+/* ARGODRIVE_FLAG_READBACK (2026-09-27): see kernel_argodrive_ids_publish. begin() encodes the
+ * publish kernel into the open batch right after the router; the caller then encodes the
+ * shared-expert work into the same batch; finish() commits the batch without waiting, polls
+ * the mailbox for the ids (checksum-validated), and starts the miss loads exactly as the
+ * end-and-read path does. A 50 ms poll timeout falls back to that path. */
+static id<MTLBuffer> g_ar_ids_box;
+static uint32_t g_ar_ids_seq;
+static uint64_t g_ar_flag_polls, g_ar_flag_fallbacks, g_ar_flag_spin_ns;
+static void ar_flag_report(void) {
+    fprintf(stderr, "ds4: Argodrive flag readback polls=%llu fallbacks=%llu spin_ms=%.1f\n",
+            (unsigned long long)g_ar_flag_polls, (unsigned long long)g_ar_flag_fallbacks, (double)g_ar_flag_spin_ns / 1e6);
+}
+int ds4_gpu_argodrive_flag_readback_begin(const ds4_gpu_tensor *selected, uint32_t n_selected) {
+    if (!g_ssd_streaming_mode || !g_batch_cb || !selected || n_selected == 0 || n_selected > 8u) return 0;
+    if (!g_ar_ids_box) {
+        g_ar_ids_box = [g_device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+        if (!g_ar_ids_box) return 0;
+        memset(g_ar_ids_box.contents, 0, 64);
+        static int registered; if (!registered) { registered = 1; atexit(ar_flag_report); }
+    }
+    id<MTLComputePipelineState> ps = ds4_gpu_get_pipeline("kernel_argodrive_ids_publish");
+    if (!ps) return 0;
+    const uint32_t seq = ++g_ar_ids_seq;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+    [enc setComputePipelineState:ps];
+    [enc setBuffer:ds4_gpu_tensor_buffer(selected) offset:ds4_gpu_tensor_offset(selected) atIndex:0];
+    [enc setBuffer:g_ar_ids_box offset:0 atIndex:1];
+    [enc setBytes:&seq length:sizeof(seq) atIndex:2];
+    [enc setBytes:&n_selected length:sizeof(n_selected) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    ds4_gpu_end_compute_encoder(g_batch_cb, enc);
+    g_batch_has_work = YES;
+    return 1;
+}
+int ds4_gpu_argodrive_flag_readback_finish(const ds4_gpu_stream_expert_table *table,
+                                           const ds4_gpu_tensor *selected, uint32_t n_selected) {
+    g_glm_stream_selected_prefetch.active = 0;
+    if (!table || !selected || n_selected == 0 ||
+        n_selected > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED || !g_ar_ids_box) return 0;
+    if (g_batch_cb && !ds4_gpu_flush_commands()) return 0;
+    int32_t ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+    for (uint32_t i = 0; i < DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED; i++) ids[i] = -1;
+    volatile uint32_t *box = (volatile uint32_t *)g_ar_ids_box.contents;
+    const uint32_t seq = g_ar_ids_seq;
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    int got = 0;
+    for (;;) {
+        if (box[0] == seq) {
+            uint32_t sum = 0x9e3779b9u ^ seq, v[8];
+            for (uint32_t i = 0; i < n_selected; i++) { v[i] = box[2u + i]; sum = (sum ^ v[i]) * 0x01000193u; }
+            if (box[1] == sum && box[0] == seq) {
+                for (uint32_t i = 0; i < n_selected; i++) ids[i] = (int32_t)v[i];
+                got = 1; break;
+            }
+        }
+        if (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0 > 50000000ull) break;
+        __asm__ __volatile__("yield");
+    }
+    g_ar_flag_spin_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
+    g_ar_flag_polls++;
+    if (!got) {
+        g_ar_flag_fallbacks++;
+        if (!ds4_gpu_wait_pending_command_buffers("flag readback fallback")) return 0;
+        if (!ds4_gpu_tensor_read(selected, 0, ids, (uint64_t)n_selected * sizeof(ids[0]))) return 0;
+    }
+    if (!ds4_gpu_stream_expert_cache_begin_selected_load(table, ids, n_selected)) return 0;
+    ds4_gpu_glm_stream_selected_prefetch_set(table, ids, n_selected);
+    return 1;
+}
 static void ds4_gpu_stream_expert_cache_clear_layer(uint32_t layer) {
     if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return;
     for (uint32_t expert = 0;

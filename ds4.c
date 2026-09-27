@@ -39977,6 +39977,37 @@ static void ar_la_issue(ds41_gpu_graph *g, const ds4_model *m, uint32_t il) {
 }
 #endif
 
+/* ARGODRIVE_FLAG_READBACK: the shared expert as a function so it can be encoded either after
+ * the router readback (as published) or before it, into the same command buffer. */
+static bool ds41_shared_expert(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                               uint32_t il, bool shared_owner) {
+    if (!shared_owner || g->tp_rank == (il & 1u)) {
+        bool fused_shared = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        const char *fuse = getenv("DS4_ARGODRIVE_SHARED_BF16");
+        fused_shared = g->streaming && g->tp_world == 1 && !g->quality && !g->imatrix &&
+            fuse && strcmp(fuse, "0") && l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
+            l->ffn_up_shexp->type == DS4_TENSOR_Q8_0;
+        if (fused_shared && !ds4_gpu_dsv41_shared_gate_up_swiglu_q8_0_tensor(
+                g->shared_gate, g->shared_up, g->shared_mid, m->map, m->size,
+                l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                DS4_N_EMBD, DS4_N_FF_EXP, g->norm, DS4_SWIGLU_CLAMP_EXP)) return false;
+#endif
+        if (!fused_shared &&
+            (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
+             !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
+             !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
+                                   DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) ||
+             !ds41_bf16(g->shared_mid, DS4_N_FF_EXP))) return false;
+        if (!ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true)) return false;
+    }
+    return true;
+}
+static int ar_flag_readback(void) {
+    static int checked, on;
+    if (!checked) { const char *e = getenv("DS4_ARGODRIVE_FLAG_READBACK"); on = e && strcmp(e, "0") != 0; checked = 1; }
+    return on;
+}
 static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
     uint64_t gate_row = 0, down_row = 0;
@@ -39985,6 +40016,7 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
+    bool ar_shared_done = false; /* ARGODRIVE_FLAG_READBACK */
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
     if (!bias) return false;
     if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) ||
@@ -40011,6 +40043,15 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
          * carried by the drain the load below performs rather than a new one. */
         if (ar_la_active()) ar_la_encode(g, m, il, token);
 #endif
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        if (ar_flag_readback() && !ar_la_active() &&
+            ds4_gpu_argodrive_flag_readback_begin(g->selected, DS4_N_EXPERT_USED)) {
+            /* ARGODRIVE_FLAG_READBACK: shared expert into the same buffer, then commit and poll. */
+            if (!ds41_shared_expert(g, m, l, il, shared_owner)) return false;
+            ar_shared_done = true;
+            if (!ds4_gpu_argodrive_flag_readback_finish(&table, g->selected, DS4_N_EXPERT_USED)) return false;
+        } else
+#endif
         if (!ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
                 &table, g->selected, DS4_N_EXPERT_USED)) return false;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
@@ -40019,26 +40060,7 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
         if (ar_la_active()) ar_la_take(g, il);
 #endif
     }
-    if (!shared_owner || g->tp_rank == (il & 1u)) {
-        bool fused_shared = false;
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-        const char *fuse = getenv("DS4_ARGODRIVE_SHARED_BF16");
-        fused_shared = g->streaming && g->tp_world == 1 && !g->quality && !g->imatrix &&
-            fuse && strcmp(fuse, "0") && l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
-            l->ffn_up_shexp->type == DS4_TENSOR_Q8_0;
-        if (fused_shared && !ds4_gpu_dsv41_shared_gate_up_swiglu_q8_0_tensor(
-                g->shared_gate, g->shared_up, g->shared_mid, m->map, m->size,
-                l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
-                DS4_N_EMBD, DS4_N_FF_EXP, g->norm, DS4_SWIGLU_CLAMP_EXP)) return false;
-#endif
-        if (!fused_shared &&
-            (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
-             !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
-             !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
-                                   DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) ||
-             !ds41_bf16(g->shared_mid, DS4_N_FF_EXP))) return false;
-        if (!ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true)) return false;
-    }
+    if (!ar_shared_done && !ds41_shared_expert(g, m, l, il, shared_owner)) return false;
     if (!ds4_gpu_routed_moe_one_tensor(routed, g->gate, g->up, g->mid, g->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
