@@ -21,6 +21,18 @@ DS41_LOCAL_BENCHMARK = {
 
 def ds41_fork_profile(model_path, replica_paths, profile='legacy'):
     """Export a reviewable configuration; this is not engine capability detection."""
+    if profile == 'v41-stack-20260927':
+        # Proposed 2026-09-27: the router profile plus flag readback of the router ids, the fused BF16
+        # epilogues, the pipeline front cache and a 4600-expert cache. Output is bit-identical to the
+        # router profile on the qualified prompts. Measured against the published binary the same day:
+        # see argodrive/candidates/2026-09-27-stack/README.md (+12.0% steady at 512/512 BAAB, 22.65/22.83 vs 20.26/20.34; +12.7% at 512/200 ABBA).
+        previous = ds41_fork_profile(model_path, replica_paths, 'v41-router-20260921')
+        env = dict(previous['environment'])
+        env.update({'DS4_ARGODRIVE_FLAG_READBACK': '1', 'DS4_ARGODRIVE_BF16_EPILOGUES': '1',
+                    'DS4_ARGODRIVE_PSO_CACHE': '1'})
+        return {**previous, 'id': profile, 'status': 'Pinned V4.1 stack candidate (2026-09-27)',
+                'environment': env, 'cache_experts': 4600,
+                'scope': 'Opt-in three-drive V4.1 profile: router fusion plus flag readback, fused BF16 epilogues, pipeline cache and a 4600-expert cache.'}
     if profile == 'v41-router-20260921':
         previous = ds41_fork_profile(model_path, replica_paths, 'champion-20260921')
         previous['environment'].update({

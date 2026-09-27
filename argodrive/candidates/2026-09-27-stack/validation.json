@@ -1,0 +1,82 @@
+{
+  "engine_source_commit": "9ad4a610ad1a0c0ac5a10f6036af6f49434bbb5c",
+  "profile_commit": "pinned by tag v41-stack-20260927",
+  "build": "CLI, benchmark, server: PASS with Apple clang 14.0.3 / macOS 26.4 SDK (DEVELOPER_DIR=/Library/Developer/CommandLineTools)",
+  "python_tests": 28,
+  "focused_fixtures": [
+    "flat_pool",
+    "q4_resident_down",
+    "q8_round_epilogue",
+    "shared_bf16",
+    "norm_bf16",
+    "hc_norm",
+    "live_scan",
+    "decay",
+    "keepalive_scope",
+    "hc_expand",
+    "qakv",
+    "rope_input"
+  ],
+  "router_fixture": {
+    "modes": 4,
+    "cases_per_mode": 84,
+    "buffer_view_offsets_bytes": [
+      0,
+      64
+    ],
+    "bit_exact": true,
+    "metal_api_validation": true
+  },
+  "core_metal": [
+    "DeepSeek V4.1 fixture (make test-deepseek41-metal)",
+    "command-memory stress fixture (make test-metal-command-memory)"
+  ],
+  "new_engine_paths": {
+    "DS4_ARGODRIVE_FLAG_READBACK": "router ids published by a GPU mailbox kernel and polled on the CPU; 8000 polls, 0 fallbacks to the blocking readback on the qualification arms; output byte-identical to the published references at 512/200 and 512/512",
+    "DS4_ARGODRIVE_BF16_EPILOGUES": "fused BF16 rounding epilogues; output byte-identical on every arm",
+    "DS4_ARGODRIVE_PSO_CACHE": "pointer-keyed pipeline lookup cache; output byte-identical on every arm",
+    "env_lookup_cache": "default on; DS4_ARGODRIVE_ENV_CACHE=0 restores the direct getenv path",
+    "note": "These paths are opt-in and off in the engine defaults. Their regression evidence is output identity across the 35 recorded arms and the passing fixtures above; no dedicated unit fixture exists yet for the mailbox kernel."
+  },
+  "cpu_backend": "not rebuilt for this candidate; the engine changes are inside Metal-only code paths",
+  "not_exercised": [
+    "Broad model-quality suite",
+    "Chat and server throughput",
+    "CUDA hardware",
+    "Distributed inference hardware",
+    "AddressSanitizer on this candidate",
+    "Prompts other than the two published references"
+  ],
+  "performance_qualification": {
+    "release": "v41-stack-20260927",
+    "control": "binary built from v41-router-qualified-20260921, profile v41-router-20260921, cache 4200",
+    "groups": [
+      "stack512",
+      "stack200"
+    ],
+    "single_lever_screens": [
+      "flag-readback",
+      "cache4600-512",
+      "cache4600-200",
+      "bf16-epilogues",
+      "pipeline-cache",
+      "env-cache"
+    ],
+    "recorded_arms": 35,
+    "qualified_arms": 8,
+    "screen_arms": 24,
+    "excluded_arms": 3,
+    "tg512_repeats_per_configuration": 2,
+    "tg200_repeats_per_configuration": 2,
+    "gates": "output SHA-256 equal to the published reference, requested cache honoured, zero swap growth, GPU active clock at least 1600 MHz on every retained arm, no build and no second engine during any arm",
+    "scope": "Steady and inclusive rates are reported separately. Broad model quality and chat/server performance remain unqualified. No comparison with current upstream is established."
+  },
+  "qualification_publication_checks": {
+    "published_evidence_verifier": "PASS: 35 CSVs, prompt and reference output hashes, cache/swap/clock gates on retained arms, medians, and 75 source hashes",
+    "python_tests": "PASS: 28",
+    "focused_metal_and_reader_fixtures": "PASS: thirteen, including router with two buffer offsets",
+    "chart": "SVG and PNG regenerated from the qualified 512-token group and visually inspected",
+    "new_files_privacy_scan": "PASS: private paths, local network addresses, personal email, credentials and session references not found",
+    "engine_changes": "Opt-in code paths added since v41-router-qualified-20260921; engine defaults unchanged"
+  }
+}

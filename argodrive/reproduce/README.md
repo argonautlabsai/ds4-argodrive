@@ -8,7 +8,7 @@ For the September 19 champion, use [the pinned snapshot and complete command](..
 
 ## Latest September 21 champion
 
-Use `--profile champion-20260921` for the published 19.58 / 19.905 steady tok/s configuration at pp512/tg200 and pp512/tg512. Follow [the complete recipe and eight-arm results](../champions/2026-09-21/README.md), including `--accounting --timeline` for matching measurement settings. The named September 19 and legacy profiles remain available. The build instructions below describe the older publication matrix.
+Use `--profile v41-stack-20260927` for the current champion, 22.740 steady / 22.325 inclusive tok/s at pp512/tg512 ([results](../candidates/2026-09-27-stack/README.md), [profile notes](V41-STACK.md)), or `--profile v41-router-20260921` for the 21 September router qualification ([notes](V41-ROUTER.md)). Use `--profile champion-20260921` for the published 19.58 / 19.905 steady tok/s configuration at pp512/tg200 and pp512/tg512. Follow [the complete recipe and eight-arm results](../champions/2026-09-21/README.md), including `--accounting --timeline` for matching measurement settings. The named September 19 and legacy profiles remain available. The build instructions below describe the older publication matrix.
 
 ## Build two separate checkouts
 
