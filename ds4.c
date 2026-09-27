@@ -377,6 +377,44 @@ int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 #include <arm_neon.h>
 #endif
 
+/* ARGODRIVE_ENV_CACHE (2026-09-27): getenv() walks the environment block on every call and the
+ * decode loop calls it thousands of times per token. The environment is fixed after start in this
+ * program (no setenv/putenv/unsetenv anywhere), so lookups are cached by name. Lock-free: a slot is
+ * claimed atomically, its value stored before its name is published. Pointer identity of the string
+ * literal is the fast path; a strcmp pass covers first use from each call site and non-literal names.
+ * DS4_ARGODRIVE_ENV_CACHE=0 disables the cache (that knob itself is read through the real getenv). */
+#include <stdlib.h>
+#include <string.h>
+static const char *ar_getenv_cached(const char *name) {
+    enum { AR_ENV_CAP = 1024 };
+    static struct { const char *name; const char *value; } ar_env_cache[AR_ENV_CAP];
+    static unsigned ar_env_n;
+    static int ar_env_disabled = -1;
+    if (ar_env_disabled < 0) {
+        const char *d = (getenv)("DS4_ARGODRIVE_ENV_CACHE");
+        ar_env_disabled = d && strcmp(d, "0") == 0;
+    }
+    if (ar_env_disabled || !name) return (getenv)(name);
+    const unsigned n = __atomic_load_n(&ar_env_n, __ATOMIC_ACQUIRE);
+    for (unsigned i = 0; i < n && i < AR_ENV_CAP; i++) {
+        if (__atomic_load_n(&ar_env_cache[i].name, __ATOMIC_ACQUIRE) == name) return ar_env_cache[i].value;
+    }
+    for (unsigned i = 0; i < n && i < AR_ENV_CAP; i++) {
+        const char *nm = __atomic_load_n(&ar_env_cache[i].name, __ATOMIC_ACQUIRE);
+        if (nm && strcmp(nm, name) == 0) {
+            const char *v = ar_env_cache[i].value;
+            const unsigned j = __atomic_fetch_add(&ar_env_n, 1u, __ATOMIC_ACQ_REL); /* alias this pointer */
+            if (j < AR_ENV_CAP) { ar_env_cache[j].value = v; __atomic_store_n(&ar_env_cache[j].name, name, __ATOMIC_RELEASE); }
+            return v;
+        }
+    }
+    const char *v = (getenv)(name);
+    const unsigned j = __atomic_fetch_add(&ar_env_n, 1u, __ATOMIC_ACQ_REL);
+    if (j < AR_ENV_CAP) { ar_env_cache[j].value = v; __atomic_store_n(&ar_env_cache[j].name, name, __ATOMIC_RELEASE); }
+    return v;
+}
+#define getenv(name) ar_getenv_cached(name)
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -39610,13 +39648,32 @@ static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
                DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
 }
 
+/* ARGODRIVE_BF16_EPILOGUES: DS4_ARGODRIVE_BF16_EPILOGUES=1 folds three standalone BF16 rounding
+ * passes per layer into their producers (attention-output low projection, attention-output
+ * expand, routed+shared add). Each producer applies the same RNE boundary the separate pass
+ * applied, so the stored values are bit-identical; only the dispatch count changes. */
+static int ar_bf16_epilogues(void) {
+    static int checked, on;
+    if (!checked) { const char *e = getenv("DS4_ARGODRIVE_BF16_EPILOGUES"); on = e && strcmp(e, "0") != 0; checked = 1; }
+    return on;
+}
 static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
                                const ds4_layer_weights *l) {
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
     const uint32_t group0 = g->tp_rank * groups;
     uint64_t output_row;
-    return tensor_nbytes(l->attn_output_a->type, 4096, &output_row) &&
-        ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size,
+    if (!tensor_nbytes(l->attn_output_a->type, 4096, &output_row)) return false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (ar_bf16_epilogues() && g->tp_world == 1) {
+        ds4_gpu_argodrive_attn_low_round(1);
+        const int ok = ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size,
+            l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row,
+            4096, 1024, groups, g->heads);
+        ds4_gpu_argodrive_attn_low_round(0);
+        return ok != 0;
+    }
+#endif
+    return ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size,
             l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * output_row,
             4096, 1024, groups, g->heads) && ds41_bf16(g->low, groups * DS4_N_LORA_O);
 }
@@ -39629,7 +39686,7 @@ static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
         metal_graph_matmul_dense_quant_kslice(g->block, m, l->attn_output_b,
             8192, (uint64_t)g->tp_rank * groups * 1024u,
             (uint64_t)groups * 1024u, DS4_N_EMBD, g->low, 0) :
-        ds41_matmul(g->block, m, l->attn_output_b, g->low, false);
+        ds41_matmul(g->block, m, l->attn_output_b, g->low, ar_bf16_epilogues()); /* ARGODRIVE_BF16_EPILOGUES: rounds in-kernel */
 }
 
 static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
@@ -39763,7 +39820,7 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     if (projected) return true;
     return ds41_attention_output(g, m, l) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
-           ds41_bf16(g->block, DS4_N_EMBD);
+           ((ar_bf16_epilogues() && g->tp_world == 1) || ds41_bf16(g->block, DS4_N_EMBD));
 }
 
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
@@ -39999,6 +40056,10 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
     if (shared_owner && g->tp_rank == (il & 1u) &&
         !ds4_gpu_add_tensor(routed, routed, g->shared, DS4_N_EMBD)) return false;
     if (!ds41_sum_partial(g, routed, il, DS4_TP_GATE_FFN)) return false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (!shared_owner && ar_bf16_epilogues())
+        return ds4_gpu_add_bf16_tensor(g->block, routed, g->shared, DS4_N_EMBD) != 0; /* ARGODRIVE_BF16_EPILOGUES */
+#endif
     return (shared_owner || ds4_gpu_add_tensor(g->block, routed, g->shared, DS4_N_EMBD)) &&
         ds41_bf16(g->block, DS4_N_EMBD);
 }

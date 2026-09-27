@@ -205,6 +205,22 @@ kernel void kernel_add2_f32(
     out[i] = a[i] + b[i];
 }
 
+// ARGODRIVE_BF16_EPILOGUES: a + b rounded to BF16 with the RNE boundary of
+// kernel_dsv41_bf16_linear, replacing the add followed by a separate rounding pass.
+kernel void kernel_add2_bf16_f32(
+        constant ds4_metal_args_add3 &args,
+        device const float *a,
+        device const float *b,
+        device float *out,
+        uint i [[thread_position_in_grid]]) {
+    if (i >= args.n) return;
+    const float s = a[i] + b[i];
+    uint bits = as_type<uint>(s);
+    if ((bits & 0x7f800000u) != 0x7f800000u)
+        bits += 0x7fffu + ((bits >> 16u) & 1u);
+    out[i] = as_type<float>(bits & 0xffff0000u);
+}
+
 kernel void kernel_add3_f32(
         constant ds4_metal_args_add3 &args,
         device const float *a,

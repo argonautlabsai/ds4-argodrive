@@ -26,6 +26,45 @@
 #include "ds4_gpu.h"
 #include "ds4_image.h"
 #include "argodrive_read.h"
+
+/* ARGODRIVE_ENV_CACHE (2026-09-27): getenv() walks the environment block on every call and the
+ * decode loop calls it thousands of times per token. The environment is fixed after start in this
+ * program (no setenv/putenv/unsetenv anywhere), so lookups are cached by name. Lock-free: a slot is
+ * claimed atomically, its value stored before its name is published. Pointer identity of the string
+ * literal is the fast path; a strcmp pass covers first use from each call site and non-literal names.
+ * DS4_ARGODRIVE_ENV_CACHE=0 disables the cache (that knob itself is read through the real getenv). */
+#include <stdlib.h>
+#include <string.h>
+static const char *ar_getenv_cached(const char *name) {
+    enum { AR_ENV_CAP = 1024 };
+    static struct { const char *name; const char *value; } ar_env_cache[AR_ENV_CAP];
+    static unsigned ar_env_n;
+    static int ar_env_disabled = -1;
+    if (ar_env_disabled < 0) {
+        const char *d = (getenv)("DS4_ARGODRIVE_ENV_CACHE");
+        ar_env_disabled = d && strcmp(d, "0") == 0;
+    }
+    if (ar_env_disabled || !name) return (getenv)(name);
+    const unsigned n = __atomic_load_n(&ar_env_n, __ATOMIC_ACQUIRE);
+    for (unsigned i = 0; i < n && i < AR_ENV_CAP; i++) {
+        if (__atomic_load_n(&ar_env_cache[i].name, __ATOMIC_ACQUIRE) == name) return ar_env_cache[i].value;
+    }
+    for (unsigned i = 0; i < n && i < AR_ENV_CAP; i++) {
+        const char *nm = __atomic_load_n(&ar_env_cache[i].name, __ATOMIC_ACQUIRE);
+        if (nm && strcmp(nm, name) == 0) {
+            const char *v = ar_env_cache[i].value;
+            const unsigned j = __atomic_fetch_add(&ar_env_n, 1u, __ATOMIC_ACQ_REL); /* alias this pointer */
+            if (j < AR_ENV_CAP) { ar_env_cache[j].value = v; __atomic_store_n(&ar_env_cache[j].name, name, __ATOMIC_RELEASE); }
+            return v;
+        }
+    }
+    const char *v = (getenv)(name);
+    const unsigned j = __atomic_fetch_add(&ar_env_n, 1u, __ATOMIC_ACQ_REL);
+    if (j < AR_ENV_CAP) { ar_env_cache[j].value = v; __atomic_store_n(&ar_env_cache[j].name, name, __ATOMIC_RELEASE); }
+    return v;
+}
+#define getenv(name) ar_getenv_cached(name)
+static int g_ar_attn_low_round_bf16; /* ARGODRIVE_BF16_EPILOGUES flag (defined once here) */
 static ar_reader g_argodrive_reader;
 /* Cumulative successful expert pread bytes; phase subtraction belongs to the
  * observer. Snapshot does not wait for GPU work or reset live reader counters. */
@@ -2774,7 +2813,28 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_id_pipeline(
     return pipeline;
 }
 
-static id<MTLComputePipelineState> ds4_gpu_get_pipeline(
+/* ARGODRIVE_PSO_CACHE: pointer-keyed front cache (opt-in, DS4_ARGODRIVE_PSO_CACHE=1). Single
+ * model worker plus helper threads: slots are claimed atomically and published after the
+ * pipeline is stored, so a racing reader either misses (and takes the slow path) or sees a
+ * complete entry. */
+static id<MTLComputePipelineState> ds4_gpu_get_pipeline_slow(const char *function_name);
+static id<MTLComputePipelineState> ds4_gpu_get_pipeline(const char *function_name) {
+    enum { AR_PSO_CAP = 512 };
+    static struct { const char *name; __unsafe_unretained id<MTLComputePipelineState> pso; } ar_pso[AR_PSO_CAP];
+    static unsigned ar_pso_n; static int enabled = -1;
+    if (enabled < 0) { const char *e = getenv("DS4_ARGODRIVE_PSO_CACHE"); enabled = e && strcmp(e, "0") != 0; }
+    if (!enabled || !function_name) return ds4_gpu_get_pipeline_slow(function_name);
+    const unsigned n = __atomic_load_n(&ar_pso_n, __ATOMIC_ACQUIRE);
+    for (unsigned i = 0; i < n && i < AR_PSO_CAP; i++)
+        if (__atomic_load_n(&ar_pso[i].name, __ATOMIC_ACQUIRE) == function_name) return ar_pso[i].pso;
+    id<MTLComputePipelineState> pso = ds4_gpu_get_pipeline_slow(function_name);
+    if (pso) { /* the dictionary keeps the strong reference for the process lifetime */
+        const unsigned j = __atomic_fetch_add(&ar_pso_n, 1u, __ATOMIC_ACQ_REL);
+        if (j < AR_PSO_CAP) { ar_pso[j].pso = pso; __atomic_store_n(&ar_pso[j].name, function_name, __ATOMIC_RELEASE); }
+    }
+    return pso;
+}
+static id<MTLComputePipelineState> ds4_gpu_get_pipeline_slow(
         const char *function_name) {
     NSString *key = [NSString stringWithFormat:@"%s", function_name];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
@@ -13135,6 +13195,23 @@ int ar_prefill_clear(void) {
     for (unsigned i=0;i<3;i++) ar_prefill_views[i]=(ar_prefill_view){0};
     return 1;
 }
+/* Argodrive 2026-09-27 (ARGODRIVE_DEFERRED_GROWTH): see ds4_gpu_stream_expert_cache_grow_to_budget. */
+static int ds4_gpu_stream_expert_cache_grow_to_budget(void);
+static uint32_t ar_prefill_cache_cap(void) {
+    static int checked; static uint32_t cap;
+    if (!checked) {
+        checked = 1; const char *e = getenv("DS4_ARGODRIVE_PREFILL_CACHE_CAP");
+        if (e && *e) { char *end = NULL; unsigned long n = strtoul(e, &end, 10); if (end != e && !*end && n <= 100000) cap = (uint32_t)n; }
+    }
+    return cap;
+}
+/* force_reuse decision: at the configured budget as before, or at the prefill cap while prefill runs. */
+static int ar_force_reuse(uint32_t budget, uint32_t entries) {
+    if (budget == 0) return 0;
+    if (entries >= budget) return 1;
+    const uint32_t cap = ar_prefill_cache_cap();
+    return !g_ar_decode_phase && cap != 0 && entries >= cap;
+}
 int ar_prefill_release(void) {
     /* End of the sweep: hand the staging reserve back before decode grows the
      * expert cache into it. */
@@ -13162,10 +13239,12 @@ int ar_prefill_release(void) {
             @autoreleasepool { [held removeAllObjects]; }
             fprintf(stderr, "ds4: Argodrive prefill staging pool released in the background (%.0f ms after the sweep)\n", ds4_gpu_now_ms() - t0);
         });
+        (void)ds4_gpu_stream_expert_cache_grow_to_budget();
         return 1;
     }
     for (unsigned set=0;set<2;set++)
         for (unsigned i=0;i<3;i++) { ar_prefill_pool[set][i]=nil; ar_prefill_pool_bytes[set][i]=0; }
+    (void)ds4_gpu_stream_expert_cache_grow_to_budget(); /* ARGODRIVE_DEFERRED_GROWTH */
     return 1;
 }
 /* Fills one set from the verified replicas. Runs on the caller's thread — the
@@ -14259,12 +14338,35 @@ static void ds4_gpu_argodrive_qos_self(void) {
     if (ds4_gpu_argodrive_qos_enabled())
         (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 }
+/* Argodrive 2026-09-27 (ARGODRIVE_POOL_SPIN): DS4_ARGODRIVE_POOL_SPIN_US=N lets the read-pool
+ * workers and the waiting decode thread spin up to N microseconds on the pool counters before
+ * blocking on the condition variables. A condition-variable wake costs tens of microseconds per
+ * thread on macOS; a miss load wakes nine workers and then the decode thread, on the critical
+ * path of every miss layer. The counters are only read racily as a hint; every decision is
+ * re-checked under the mutex exactly as before. Unset or 0 keeps the blocking waits. */
+static unsigned ar_pool_spin_us(void) {
+    static int checked; static unsigned us;
+    if (!checked) {
+        checked = 1; const char *e = getenv("DS4_ARGODRIVE_POOL_SPIN_US");
+        if (e && *e) { char *end = NULL; unsigned long n = strtoul(e, &end, 10); if (end != e && !*end && n <= 20000) us = (unsigned)n; }
+    }
+    return us;
+}
 static void *ds4_gpu_stream_expert_pread_pool_worker(void *arg) {
     const uint32_t worker_index = (uint32_t)(uintptr_t)arg;
     uint64_t seen_generation = 0;
     ds4_gpu_argodrive_qos_self();
+    const unsigned ar_spin = ar_pool_spin_us();
 
     for (;;) {
+        if (ar_spin) { /* hint spin before taking the mutex */
+            const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+            while (__atomic_load_n(&g_stream_expert_pread_pool_generation, __ATOMIC_RELAXED) == seen_generation &&
+                   !__atomic_load_n(&g_stream_expert_pread_pool_stopping, __ATOMIC_RELAXED) &&
+                   clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0 < (uint64_t)ar_spin * 1000u) {
+                __asm__ __volatile__("yield");
+            }
+        }
         pthread_mutex_lock(&g_stream_expert_pread_pool_mutex);
         while (!g_stream_expert_pread_pool_stopping &&
                g_stream_expert_pread_pool_generation == seen_generation) {
@@ -14414,6 +14516,16 @@ static int ds4_gpu_stream_expert_pread_pool_wait(void) {
     if (!g_stream_expert_pread_pool_initialized) return 0;
     ds4_gpu_argodrive_keepalive_gap(1);
 
+    {   /* ARGODRIVE_POOL_SPIN: hint spin before blocking on the done condition */
+        const unsigned ar_spin = ar_pool_spin_us();
+        if (ar_spin) {
+            const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+            while (__atomic_load_n(&g_stream_expert_pread_pool_remaining_workers, __ATOMIC_RELAXED) != 0 &&
+                   clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0 < (uint64_t)ar_spin * 1000u) {
+                __asm__ __volatile__("yield");
+            }
+        }
+    }
     pthread_mutex_lock(&g_stream_expert_pread_pool_mutex);
     while (g_stream_expert_pread_pool_remaining_workers != 0) {
         pthread_cond_wait(&g_stream_expert_pread_pool_done_cond,
@@ -14775,6 +14887,64 @@ static void ds4_gpu_stream_expert_slab_warm(id<MTLBuffer> slab, uint32_t index) 
     }
 }
 
+/* Argodrive 2026-09-27 (ARGODRIVE_DEFERRED_GROWTH): with DS4_ARGODRIVE_DEFERRED_GROWTH=1 the slab pool
+ * grows to the configured budget once prefill has released its staging reserve. The new slabs are
+ * wired here in one step (outside the decode loop) and every new slot is pushed on the free-slot
+ * list, so decode fills them before it starts evicting. Cache contents never change the arithmetic;
+ * only which experts stay resident. */
+static int ds4_gpu_stream_expert_cache_grow_to_budget(void) {
+    const char *e = getenv("DS4_ARGODRIVE_DEFERRED_GROWTH");
+    if (!e || strcmp(e, "0") == 0) return 1;
+    if (!ds4_gpu_stream_expert_slab_enabled() || g_stream_expert_cache_slab_slot_bytes == 0) return 1;
+    const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
+    const uint32_t before = g_stream_expert_cache_slab_total_slots;
+    if (budget == 0 || before >= budget) return 1;
+    const double t0 = ds4_gpu_now_ms();
+    uint64_t wired = 0; uint32_t added_slabs = 0;
+    while (g_stream_expert_cache_slab_total_slots < budget &&
+           g_stream_expert_cache_slab_count < DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS) {
+        const uint64_t slot_bytes = g_stream_expert_cache_slab_slot_bytes;
+        uint64_t slots64 = ds4_gpu_stream_expert_slab_target_bytes() / slot_bytes;
+        if (slots64 == 0) slots64 = 1;
+        uint32_t slots = slots64 > UINT32_MAX ? UINT32_MAX : (uint32_t)slots64;
+        const uint32_t remaining = budget - g_stream_expert_cache_slab_total_slots;
+        if (slots > remaining) slots = remaining;
+        if (g_stream_expert_cache_slab_total_slots + slots > DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES ||
+            g_stream_expert_cache_free_slot_count + slots > DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES) break;
+        id<MTLBuffer> slab_buffer = nil;
+        while (slots != 0) {
+            if ((uint64_t)slots * slot_bytes <= (uint64_t)NSUIntegerMax) {
+                slab_buffer = ds4_gpu_stream_expert_alloc_slab_buffer((uint64_t)slots * slot_bytes,
+                                                                      @"ds4_stream_expert_slab_growth");
+                if (slab_buffer) break;
+            }
+            slots /= 2u;
+        }
+        if (!slab_buffer || slots == 0) break;
+        if (mlock([slab_buffer contents], (size_t)[slab_buffer length]) != 0) {
+            fprintf(stderr, "ds4: Argodrive deferred cache growth stopped: mlock failed (%s)\n", strerror(errno));
+            break; /* unregistered: ARC frees the buffer */
+        }
+        const uint32_t slab = g_stream_expert_cache_slab_count++;
+        g_stream_expert_cache_slabs[slab] = slab_buffer;
+        g_stream_expert_cache_slab_start_slot[slab] = g_stream_expert_cache_slab_total_slots;
+        g_stream_expert_cache_slab_slot_count[slab] = slots;
+        g_stream_expert_cache_slab_slots_used[slab] = slots; /* handed out through the free list */
+        for (uint32_t i = 0; i < slots; i++) {
+            const uint32_t slot = g_stream_expert_cache_slab_total_slots + i;
+            g_stream_expert_cache_slab_slot_locked[slot] = 1;
+            g_stream_expert_cache_free_slots[g_stream_expert_cache_free_slot_count++] = slot;
+        }
+        g_stream_expert_cache_slab_total_slots += slots;
+        g_stream_expert_cache_mlock_bytes += (uint64_t)[slab_buffer length];
+        wired += (uint64_t)[slab_buffer length];
+        added_slabs++;
+    }
+    fprintf(stderr, "ds4: Argodrive deferred cache growth: slots %u -> %u of %u, %u slab%s, %.2f GiB wired in %.0f ms\n",
+            before, g_stream_expert_cache_slab_total_slots, budget, added_slabs, added_slabs == 1 ? "" : "s",
+            ds4_gpu_gib(wired), ds4_gpu_now_ms() - t0);
+    return 1;
+}
 static int ds4_gpu_stream_expert_slab_slot_range(
         uint32_t slot,
         uint32_t *slab_index,
@@ -14998,6 +15168,10 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
         const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
         if (budget != 0 && g_stream_expert_cache_slab_total_slots >= budget) {
             return 0;
+        }
+        if (!g_ar_decode_phase) { /* ARGODRIVE_DEFERRED_GROWTH: no new slabs past the prefill cap */
+            const uint32_t prefill_cap = ar_prefill_cache_cap();
+            if (prefill_cap != 0 && g_stream_expert_cache_slab_total_slots >= prefill_cap) return 0;
         }
         uint64_t target = ds4_gpu_stream_expert_slab_target_bytes();
         uint64_t slots64 = target / slot_bytes;
@@ -17124,8 +17298,7 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
     }
     const uint32_t cache_budget =
         ds4_gpu_stream_expert_cache_configured_budget();
-    const int force_reuse =
-        cache_budget != 0 && g_stream_expert_cache_entry_count >= cache_budget;
+    const int force_reuse = ar_force_reuse(cache_budget, g_stream_expert_cache_entry_count); /* ARGODRIVE_DEFERRED_GROWTH */
     if (!ds4_gpu_stream_expert_cache_prepare_load_buffers(layer,
                                                           expert,
                                                           layer,
@@ -17579,8 +17752,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
     for (uint32_t load_i = 0; load_i < p->n_loads; load_i++) {
         const uint32_t slot = p->load_slots[load_i];
         const uint32_t expert = (uint32_t)p->selected_ids[slot];
-        const int force_reuse =
-            cache_budget != 0 && reserved_entries >= cache_budget;
+        const int force_reuse = ar_force_reuse(cache_budget, reserved_entries);
 
         ds4_gpu_stream_expert_readahead_range(p->gate_abs_offsets[slot],
                                               gate_expert_bytes);
@@ -17869,8 +18041,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
     for (uint32_t load_i = 0; load_i < n_loads; load_i++) {
         const uint32_t slot = load_slots[load_i];
         const uint32_t expert = (uint32_t)selected_ids[slot];
-        const int force_reuse =
-            cache_budget != 0 && reserved_entries >= cache_budget;
+        const int force_reuse = ar_force_reuse(cache_budget, reserved_entries);
 
         if (!gpu_copy_source) {
             ds4_gpu_stream_expert_readahead_range(gate_abs_offsets[slot],
@@ -18476,8 +18647,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                 continue;
             }
 
-            const int force_reuse =
-                cache_budget != 0 && reserved_entries >= cache_budget;
+            const int force_reuse = ar_force_reuse(cache_budget, reserved_entries);
             /* The worker pool reads this entire batch below. Serial read-ahead
              * here waits for the same pages before parallel I/O can begin. */
             const double buffer_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
@@ -27045,7 +27215,7 @@ static int ds4_gpu_attention_output_q8_batch_impl(
                     .nr0 = 2,
                 };
                 id<MTLComputePipelineState> pipeline =
-                    ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32", 4);
+                    ds4_gpu_get_mul_mv_pipeline(g_ar_attn_low_round_bf16 ? "kernel_dsv4_attn_out_low_q8_0_bf16_f32" : "kernel_dsv4_attn_out_low_q8_0_f32", 4); /* ARGODRIVE_BF16_EPILOGUES */
                 ok = ds4_gpu_encode_attn_out_low_q8_direct(cb,
                                                              pipeline,
                                                              &args,
@@ -27800,7 +27970,7 @@ int ds4_gpu_attention_output_q8_tp_tensor(
             .nr0 = 2,
         };
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32", 4);
+            ds4_gpu_get_mul_mv_pipeline(g_ar_attn_low_round_bf16 ? "kernel_dsv4_attn_out_low_q8_0_bf16_f32" : "kernel_dsv4_attn_out_low_q8_0_f32", 4); /* ARGODRIVE_BF16_EPILOGUES */
         int ok = ds4_gpu_encode_attn_out_low_q8_direct(cb,
                 pipeline,
                 &args,
@@ -27904,7 +28074,7 @@ int ds4_gpu_attention_output_low_q8_tensor(
                 .nr0 = 2,
             };
             id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32", 4);
+                ds4_gpu_get_mul_mv_pipeline(g_ar_attn_low_round_bf16 ? "kernel_dsv4_attn_out_low_q8_0_bf16_f32" : "kernel_dsv4_attn_out_low_q8_0_f32", 4); /* ARGODRIVE_BF16_EPILOGUES */
             ok = ds4_gpu_encode_attn_out_low_q8_direct(cb,
                                                          pipeline,
                                                          &args,
@@ -32105,6 +32275,47 @@ int ds4_gpu_swiglu_tensor(
     return 1;
 }
 
+/* ARGODRIVE_BF16_EPILOGUES: host side of the three folded rounding passes. */
+void ds4_gpu_argodrive_attn_low_round(int on) { g_ar_attn_low_round_bf16 = on ? 1 : 0; }
+int ds4_gpu_add_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b,
+        uint32_t                n) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !a || !b || n == 0) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_add2_bf16_f32");
+        id<MTLBuffer> abuf = ds4_gpu_tensor_buffer(a);
+        id<MTLBuffer> bbuf = ds4_gpu_tensor_buffer(b);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t bytes = (uint64_t)n * sizeof(float);
+        if (!pipeline || !abuf || !bbuf || !outbuf ||
+            ds4_gpu_tensor_bytes(a) < bytes || ds4_gpu_tensor_bytes(b) < bytes || ds4_gpu_tensor_bytes(out) < bytes) {
+            fprintf(stderr, "ds4: Metal tensor add (bf16 epilogue) unavailable or undersized buffers\n");
+            return 0;
+        }
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        ds4_gpu_add_flat_args args = { .n = n };
+        NSUInteger nth = pipeline.maxTotalThreadsPerThreadgroup;
+        if (nth > 256u) nth = 256u;
+        if (nth > (NSUInteger)n) nth = (NSUInteger)n;
+        if (nth == 0u) nth = 1u;
+        const NSUInteger groups = ((NSUInteger)n + nth - 1u) / nth;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:abuf offset:ds4_gpu_tensor_offset(a) atIndex:1];
+        [enc setBuffer:bbuf offset:ds4_gpu_tensor_offset(b) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "tensor add bf16")) return 0;
+    }
+    return 1;
+}
 int ds4_gpu_add_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *a,

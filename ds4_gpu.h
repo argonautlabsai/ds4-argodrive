@@ -2580,6 +2580,8 @@ int ds4_gpu_swiglu_tensor(
         float                   clamp,
         float                   weight);
 
+int ds4_gpu_add_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint32_t n); /* ARGODRIVE_BF16_EPILOGUES */
+void ds4_gpu_argodrive_attn_low_round(int on);
 int ds4_gpu_add_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *a,
