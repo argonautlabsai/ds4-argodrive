@@ -1,18 +1,18 @@
 # DS4 Argodrive — DeepSeek V4.1 on three SSDs
 
-**22.740 steady tok/s at 512 generated tokens; 22.325 generation-inclusive tok/s.** DeepSeek V4.1 Flash Q4 (518.6 GB), M5 Max with 128 GiB, internal SSD plus two Thunderbolt 5 NVMe enclosures; 512-token prompt. Measured on 27 September against the published 21 September binary in the same session: **+12.02% steady / +11.40% inclusive** at 512 generated tokens (BAAB, two runs per configuration) and **+12.65% / +11.31%** at 200 (ABBA). Same drives and same model copies as the previous champion; byte-identical reference outputs on every arm, zero swap growth, GPU clocks held at 1,620 MHz.
+**23.260 steady tok/s at 512 generated tokens; 22.755 generation-inclusive tok/s.** DeepSeek V4.1 Flash Q4 (518.6 GB), M5 Max with 128 GiB, internal SSD plus two Thunderbolt 5 NVMe enclosures; 512-token prompt. Measured on 28 September against the published 27 September binary, built from its tag and run in the same session with the same profile and 4,600-expert cache: **+1.48% steady / +1.27% inclusive** at 512 generated tokens (BAAB, two runs per configuration) and **+1.71%** at 200 (ABBA). Same drives and model copies; byte-identical reference outputs on every arm, zero swap growth, GPU clocks held at 1,620 MHz.
 
-![Matched 512-token steady and inclusive results](argodrive/candidates/2026-09-27-stack/comparison.svg)
+![Matched 512-token steady and inclusive results](argodrive/candidates/2026-09-28-flush/comparison.svg)
 
-| Metric, pp512/tg512 | Published champion, same-session rerun | Qualified stack profile | Gain |
+| Metric, pp512/tg512 | Published 27 September binary, same-session rerun | Profile `v41-stack-20260928` | Gain |
 |---|---:|---:|---:|
-| Steady tok/s, median | 20.300 | **22.740** | **+12.02%** |
-| Including first decode step, median | 20.040 | **22.325** | **+11.40%** |
-| Steady tok/s, both runs | 20.26 / 20.34 | **22.65 / 22.83** | pairs +2.39, +2.49 |
+| Steady tok/s, median | 22.920 | **23.260** | **+1.48%** |
+| Including first decode step, median | 22.470 | **22.755** | **+1.27%** |
+| Steady tok/s, both runs | 22.88 / 22.96 | **23.18 / 23.34** | pairs +0.30, +0.38 |
 
-Against the published 21 September medians (20.375 steady / 20.115 inclusive) the new medians are **+11.6% / +11.0%**. Both decode metrics exclude startup and prefill; steady also excludes the first decode step. The gain is software only. It costs about 2% prefill (44.02 against 44.95 tok/s) and about 80 ms on the first decode step, because the larger cache seeds more expert slabs. This compares against our previous Argodrive champion, not current upstream ds4, and does not establish broad model quality or chat/server performance. Three clock-affected arms from the first attempt remain excluded and available alongside the 32 passing arms.
+A small step on top of the 27 September stack, which carried the large move (+12.0% over the 21 September champion, see below). The two additions are a post-MoE flush, which commits a layer's routed work as soon as it is encoded when that layer waited for expert reads, and an eviction pre-scan that ranks cache victims while the CPU waits on the router mailbox. Neither touches arithmetic or expert selection. Next-layer prediction was re-tested the same day in three forms and lost; the package records why. Both decode metrics exclude startup and prefill; steady also excludes the first decode step. This compares against our previous Argodrive champion, not current upstream ds4, and does not establish broad model quality or chat/server performance.
 
-[**Qualified results release**](https://github.com/argonautlabsai/ds4-argodrive/releases/tag/v41-stack-20260927) · [**Results, all 35 CSVs and validation**](argodrive/candidates/2026-09-27-stack/README.md) · [**Reproduce the result**](argodrive/reproduce/V41-STACK.md#run) · [**Machine-readable evidence**](argodrive/candidates/2026-09-27-stack/results.json)
+[**Qualified results release**](https://github.com/argonautlabsai/ds4-argodrive/releases/tag/v41-stack-20260928) · [**Results, all 35 CSVs and the rejected levers**](argodrive/candidates/2026-09-28-flush/README.md) · [**Reproduce the result**](argodrive/reproduce/V41-STACK.md#run) · [**Machine-readable evidence**](argodrive/candidates/2026-09-28-flush/results.json)
 
 **Against pinned upstream ds4 on one, two and three drives** (27 September, one interleaved session, 512-token prompt, 200 generated; upstream median of 6 arms, fork rungs median of two):
 
@@ -30,25 +30,25 @@ Against the published 21 September medians (20.375 steady / 20.115 inclusive) th
 
 The internal-only row is software only: the same laptop, the same single SSD and the same model file as the upstream control, with no replicas. Output is byte-identical to upstream on all 12 arms. Every arm ran as a fresh process with an empty expert cache; fork arms held 1,620 MHz GPU clocks and zero swap growth. The fork rungs use profile `v41-stack-20260927` with 4,600 cached experts; upstream sizes its cache automatically (3,688). This is the pinned upstream base of this fork, not current upstream ds4. [Ladder results, all 12 CSVs and the verifier](argodrive/candidates/2026-09-27-ladder/README.md) · [machine-readable](argodrive/candidates/2026-09-27-ladder/results.json).
 
-Profile `v41-stack-20260927` is the published router profile plus three opt-in engine paths and a 4,600-expert cache (was 4,200). **Flag readback** (+6.6% alone): a mailbox kernel publishes the router's expert ids from inside the running command buffer; the CPU polls it and starts the miss reads while the shared-expert work, encoded before the commit, keeps the GPU busy. **Larger cache** (+3.0 to +3.3% alone): steady misses per token fall from 13.1 to 11.1 at 512 tokens. **Fused BF16 epilogues** (+0.5%) and a **pipeline-state cache** (+0.8%), plus an environment-lookup cache that is now the code default (+0.5%). Each lever was screened with interleaved pairs before the stack was qualified as a whole. Cache sizes above 4,600 tripped the swap guard; memory keep-alives, read-pool spinning, completion polling, Q8 row tiling and pipeline pre-warming were screened and rejected. Engine defaults are unchanged and the earlier profiles still run.
+Profile `v41-stack-20260928` is `v41-stack-20260927` plus exactly `DS4_ARGODRIVE_POST_MOE_FLUSH=1` and `DS4_ARGODRIVE_VICTIM_PRESCAN=1`; the earlier profiles remain selectable. Profile `v41-stack-20260927` is the published router profile plus three opt-in engine paths and a 4,600-expert cache (was 4,200). **Flag readback** (+6.6% alone): a mailbox kernel publishes the router's expert ids from inside the running command buffer; the CPU polls it and starts the miss reads while the shared-expert work, encoded before the commit, keeps the GPU busy. **Larger cache** (+3.0 to +3.3% alone): steady misses per token fall from 13.1 to 11.1 at 512 tokens. **Fused BF16 epilogues** (+0.5%) and a **pipeline-state cache** (+0.8%), plus an environment-lookup cache that is now the code default (+0.5%). Each lever was screened with interleaved pairs before the stack was qualified as a whole. Cache sizes above 4,600 tripped the swap guard; memory keep-alives, read-pool spinning, completion polling, Q8 row tiling and pipeline pre-warming were screened and rejected. Engine defaults are unchanged and the earlier profiles still run.
 
 This fork builds on [ds4 by Salvatore Sanfilippo (antirez) and contributors](https://github.com/antirez/ds4). The reader, scheduling changes and Metal kernels are included in this repository; no private provider is required. Original licences, acknowledgements and [credits](CREDITS.md) are preserved. Development and review used Claude, ChatGPT and OpenAI Codex.
 
-Build release tag `v41-stack-20260927` and select profile `v41-stack-20260927`. Prefill reads split **10:5:5**, decode **10:6:6**; Engram stays asynchronous on the primary SSD. Keepalive consumes additional power and can lose performance under competing GPU work.
+Build release tag `v41-stack-20260928` and select profile `v41-stack-20260928`. Prefill reads split **10:5:5**, decode **10:6:6**; Engram stays asynchronous on the primary SSD. Keepalive consumes additional power and can lose performance under competing GPU work.
 
 ## Build and test
 
 ```sh
-git clone --branch v41-stack-20260927 https://github.com/argonautlabsai/ds4-argodrive.git
+git clone --branch v41-stack-20260928 https://github.com/argonautlabsai/ds4-argodrive.git
 cd ds4-argodrive
 export DEVELOPER_DIR=/Library/Developer/CommandLineTools
 export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
 xcrun clang --version
 make -j4 CC="$(xcrun --find clang)" ds4 ds4-bench ds4-server
-python3 argodrive/candidates/2026-09-27-stack/verify-results.py
+python3 argodrive/candidates/2026-09-28-flush/verify-results.py
 ```
 
-The measured toolchain was Apple clang 14.0.3 / macOS 26.4 SDK. Verify your installed versions and follow the [full profile run command](argodrive/reproduce/V41-STACK.md#run) with three verified model copies. Model files are separate. The [validation record](argodrive/candidates/2026-09-27-stack/validation.json) lists passed checks and untested configurations.
+The measured toolchain was Apple clang 14.0.3 / macOS 26.4 SDK. Verify your installed versions and follow the [full profile run command](argodrive/reproduce/V41-STACK.md#run) with three verified model copies. Model files are separate. The [validation record](argodrive/candidates/2026-09-28-flush/validation.json) lists passed checks and untested configurations.
 
 ## Inspect your storage with Argodrive
 
@@ -56,6 +56,8 @@ The measured toolchain was Apple clang 14.0.3 / macOS 26.4 SDK. Verify your inst
 
 <details>
 <summary>Earlier benchmark campaigns and reproduction records</summary>
+
+**Previous champion (27 September):** [stack qualification](argodrive/candidates/2026-09-27-stack/README.md), release `v41-stack-20260927`, profile `v41-stack-20260927`: **22.740 steady / 22.325 inclusive tok/s** at pp512/tg512 (+12.02% / +11.40% over the 21 September champion, BAAB, two runs per configuration; runs 22.65 / 22.83 vs 20.26 / 20.34) and 22.490 / 21.500 at pp512/tg200 (+12.65%). Flag readback of the router ids, a 4,600-expert cache, fused BF16 epilogues and a pipeline cache; prefill about 2% slower and the first decode step 452 vs 371 ms. Against the published 21 September medians (20.375 steady / 20.115 inclusive) its medians were +11.6% / +11.0%. Both decode metrics exclude startup and prefill; steady also excludes the first decode step. The gain is software only. It costs about 2% prefill (44.02 against 44.95 tok/s) and about 80 ms on the first decode step, because the larger cache seeds more expert slabs. This compares against our previous Argodrive champion, not current upstream ds4, and does not establish broad model quality or chat/server performance. Three clock-affected arms from the first attempt remain excluded and available alongside the 32 passing arms.
 
 **Previous champion (21 September):** [router profile qualification](argodrive/candidates/2026-09-21-router/README.md), release `v41-router-qualified-20260921`, profile `v41-router-20260921`: **20.375 steady / 20.115 inclusive tok/s** at pp512/tg512 (+2.75% / +2.76% over the 19 September champion, BAAB, two runs per configuration) and 20.105 / 19.445 at pp512/tg200; alternate-prompt check 16.24 / 15.78, one pair. Ten clock-affected attempts are retained and excluded.
 

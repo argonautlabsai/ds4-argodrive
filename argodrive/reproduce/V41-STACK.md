@@ -1,5 +1,24 @@
 # V4.1 stack profile
 
+## 28 September update: `v41-stack-20260928`
+
+`v41-stack-20260928` is `v41-stack-20260927` plus exactly:
+
+```sh
+DS4_ARGODRIVE_POST_MOE_FLUSH=1
+DS4_ARGODRIVE_VICTIM_PRESCAN=1
+```
+
+The [28 September package](../candidates/2026-09-28-flush/README.md) records 23.260 steady /
+22.755 inclusive tok/s at pp512/tg512 (+1.48% / +1.27%) and 22.940 steady at pp512/tg200
+(+1.71%) against the `v41-stack-20260927` binary built from its tag, same session, output
+byte-identical, together with the same-day levers that lost. The flush commits a layer's routed
+MoE right after it is encoded when the layer waited for expert reads; the pre-scan ranks eviction
+candidates while the CPU waits on the router mailbox and re-validates each one at use. Run the
+command below with `--profile v41-stack-20260928`; everything else on this page applies unchanged.
+The drive ladder against upstream was measured with the 27 September profile.
+
+
 `v41-stack-20260927` extends the published `v41-router-20260921` profile with
 three opt-in engine paths and a larger expert cache. Select it explicitly; the
 existing profiles and engine defaults are unchanged.

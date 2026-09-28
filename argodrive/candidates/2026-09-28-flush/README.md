@@ -6,6 +6,8 @@ run in the same session with the same profile and 4,600-expert cache: **+1.48% s
 At pp512/tg200 (ABBA): **22.940 against 22.555**, +1.71% (pairs +0.33, +0.44).
 Output is byte-identical to the published references on every arm in this package. Profile: `v41-stack-20260928`.
 
+![Matched 512-token steady and inclusive results](comparison.svg)
+
 This is a small, real gain, not the 10% the session set out for. The rest of this page records what was
 measured, including the levers that lost.
 
@@ -70,7 +72,7 @@ or the dispatch count to move; neither did today.
 
 ## All attempts are retained
 
-[Timing CSVs](arms/) · [Measured results](results.json) · [Source checksums](source-sha256.json) · [Profile export](profile.json)
+[Timing CSVs](arms/) · [Measured results](results.json) · [Source checksums](source-sha256.json) · [Profile export](profile.json) · [Validation](validation.json)
 
 | Group | Order | Steady tok/s in order | Disposition |
 |---|---|---|---|

@@ -1,0 +1,85 @@
+{
+  "engine_source_commit": "9ad4a610ad1a0c0ac5a10f6036af6f49434bbb5c",
+  "profile_commit": "pinned by tag v41-stack-20260928",
+  "build": "CLI, benchmark, server: PASS with Apple clang 14.0.3 / macOS 26.4 SDK (DEVELOPER_DIR=/Library/Developer/CommandLineTools)",
+  "python_tests": 29,
+  "focused_fixtures": [
+    "flat_pool",
+    "q4_resident_down",
+    "q8_round_epilogue",
+    "shared_bf16",
+    "norm_bf16",
+    "hc_norm",
+    "live_scan",
+    "decay",
+    "keepalive_scope",
+    "hc_expand",
+    "qakv",
+    "rope_input"
+  ],
+  "router_fixture": {
+    "modes": 4,
+    "cases_per_mode": 84,
+    "buffer_view_offsets_bytes": [
+      0,
+      64
+    ],
+    "bit_exact": true,
+    "metal_api_validation": true
+  },
+  "core_metal": [
+    "DeepSeek V4.1 fixture (make test-deepseek41-metal)",
+    "command-memory stress fixture (make test-metal-command-memory)"
+  ],
+  "new_engine_paths": {
+    "DS4_ARGODRIVE_POST_MOE_FLUSH": "commit after the routed MoE of a layer that waited for reads (mode 1) or every layer (mode 2); output byte-identical on every arm",
+    "DS4_ARGODRIVE_VICTIM_PRESCAN": "eviction candidates ranked during the mailbox wait and re-validated at use; 2,441 of 2,441 evictions took a candidate, no fallbacks; output byte-identical",
+    "DS4_ARGODRIVE_DECODE_AHEAD (through the mailbox), DS4_ARGODRIVE_DECODE_AHEAD_MISSING_ONLY": "opt-in, measured and rejected (-1% to -8%); off by default",
+    "note": "All paths are opt-in and off in the engine defaults. Regression evidence is output identity across the 35 recorded arms plus the passing fixtures; no dedicated unit fixture exists for the flush or the pre-scan."
+  },
+  "cpu_backend": "not rebuilt for this candidate; the engine changes are inside Metal-only code paths",
+  "not_exercised": [
+    "Broad model-quality suite",
+    "Chat and server throughput",
+    "CUDA hardware",
+    "Distributed inference hardware",
+    "AddressSanitizer on this candidate",
+    "Prompts other than the two published references"
+  ],
+  "performance_qualification": {
+    "release": "v41-stack-20260928",
+    "control": "binary built from tag v41-stack-20260927, profile v41-stack-20260927, cache 4600",
+    "groups": [
+      "final512",
+      "final200"
+    ],
+    "earlier_build_groups": [
+      "flush512",
+      "flush200"
+    ],
+    "single_lever_screens": [
+      "post-moe-flush-miss-layers",
+      "post-moe-flush-all-layers",
+      "victim-prescan",
+      "lookahead-mailbox-k2",
+      "lookahead-missing-only-k3"
+    ],
+    "recorded_arms": 35,
+    "qualified_arms": 8,
+    "earlier_qualification_arms": 8,
+    "screen_arms": 18,
+    "excluded_arms": 1,
+    "tg512_repeats_per_configuration": 2,
+    "tg200_repeats_per_configuration": 2,
+    "gates": "output SHA-256 equal to the published reference, requested cache honoured, zero swap growth, GPU active clock at least 1600 MHz on every retained arm, no build and no second engine during any arm",
+    "scope": "Steady and inclusive rates reported separately. Broad model quality and chat/server performance remain unqualified. No comparison with current upstream is established here."
+  },
+  "qualification_publication_checks": {
+    "published_evidence_verifier": "PASS: 35 CSVs, prompt and reference output hashes, cache/swap/clock gates on retained arms, medians, and 75 source hashes",
+    "python_tests": "PASS: 29",
+    "focused_metal_and_reader_fixtures": "PASS: thirteen, including router with two buffer offsets",
+    "chart": "SVG and PNG regenerated from the final 512-token group",
+    "new_files_privacy_scan": "PASS: private paths, local network addresses, personal email, credentials and session references not found",
+    "engine_changes": "Opt-in code paths added since v41-stack-20260927; engine defaults unchanged"
+  }
+}
