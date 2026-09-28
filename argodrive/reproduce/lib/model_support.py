@@ -21,6 +21,15 @@ DS41_LOCAL_BENCHMARK = {
 
 def ds41_fork_profile(model_path, replica_paths, profile='legacy'):
     """Export a reviewable configuration; this is not engine capability detection."""
+    if profile == 'v41-stack-20260928':
+        # 2026-09-28: the 27 September stack plus the post-MoE flush and the eviction pre-scan. Output is
+        # bit-identical to the stack profile on the qualified prompts. Measured against the published
+        # v41-stack-20260927 binary the same day: see argodrive/candidates/2026-09-28-flush/README.md.
+        previous = ds41_fork_profile(model_path, replica_paths, 'v41-stack-20260927')
+        env = dict(previous['environment'])
+        env.update({'DS4_ARGODRIVE_POST_MOE_FLUSH': '1', 'DS4_ARGODRIVE_VICTIM_PRESCAN': '1'})
+        return {**previous, 'id': profile, 'status': 'Pinned V4.1 stack candidate (2026-09-28)', 'environment': env,
+                'scope': previous['scope'].replace('Opt-in three-drive V4.1 profile:', 'Opt-in three-drive V4.1 profile: post-MoE flush,')}
     if profile == 'v41-stack-20260927':
         # Proposed 2026-09-27: the router profile plus flag readback of the router ids, the fused BF16
         # epilogues, the pipeline front cache and a 4600-expert cache. Output is bit-identical to the

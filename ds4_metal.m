@@ -16444,6 +16444,55 @@ static int ds4_gpu_stream_expert_cache_entry_reusable(
            e->down_expert_bytes == down_expert_bytes;
 }
 
+/* ARGODRIVE_VICTIM_PRESCAN (2026-09-28): while the CPU spins on the router mailbox it ranks the
+ * lowest-hotness reusable entries; a miss then takes the first candidate that still passes every
+ * check take_reusable() applies (reusable, not in flight, not protected, unchanged hotness and age).
+ * Anything else falls back to the full scan. Eviction choice never changes model output. */
+#define AR_PRESCAN_MAX 8u
+typedef struct { uint32_t layer, expert, hotness; uint64_t last_used; } ar_prescan_cand;
+static ar_prescan_cand g_ar_prescan[AR_PRESCAN_MAX];
+static uint32_t g_ar_prescan_n;
+static uint64_t g_ar_prescan_runs, g_ar_prescan_used, g_ar_prescan_fallbacks;
+static int ar_victim_prescan_enabled(void) {
+    static int c = -1;
+    if (c < 0) { const char *e = getenv("DS4_ARGODRIVE_VICTIM_PRESCAN"); c = e && strcmp(e, "0") != 0; }
+    return c;
+}
+static void ar_victim_prescan_report(void) {
+    fprintf(stderr, "ds4: Argodrive victim prescan runs=%llu used=%llu fallbacks=%llu\n",
+            (unsigned long long)g_ar_prescan_runs, (unsigned long long)g_ar_prescan_used, (unsigned long long)g_ar_prescan_fallbacks);
+}
+static uint32_t ar_cache_victim_hotness(uint32_t layer, uint32_t expert);
+static int ds4_gpu_stream_expert_cache_entry_reusable(const ds4_gpu_stream_expert_cache_entry *e, uint64_t gate_expert_bytes, uint64_t down_expert_bytes);
+static void ar_victim_prescan(uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    g_ar_prescan_n = 0;
+    if (!ar_victim_prescan_enabled()) return;
+    const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
+    if (budget == 0 || g_stream_expert_cache_entry_count < budget) return;
+    static int registered; if (!registered) { registered = 1; atexit(ar_victim_prescan_report); }
+    const char *scan = getenv("DS4_ARGODRIVE_LIVE_SCAN");
+    const int sparse = scan && strcmp(scan, "0") != 0;
+    for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+        for (uint32_t expert = ar_cache_next(layer, 0, sparse);
+             expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+             expert = ar_cache_next(layer, expert + 1u, sparse)) {
+            const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert];
+            if (!ds4_gpu_stream_expert_cache_entry_reusable(e, gate_expert_bytes, down_expert_bytes)) continue;
+            if (ds4_gpu_stream_expert_cache_entry_inflight(e)) continue;
+            const uint32_t hot = ar_cache_victim_hotness(layer, expert);
+            const uint64_t age = e->last_used;
+            /* insertion into the sorted candidate list (ascending hotness, then oldest first) */
+            uint32_t pos = g_ar_prescan_n;
+            while (pos > 0 && (hot < g_ar_prescan[pos - 1u].hotness ||
+                               (hot == g_ar_prescan[pos - 1u].hotness && age < g_ar_prescan[pos - 1u].last_used))) pos--;
+            if (pos >= AR_PRESCAN_MAX) continue;
+            if (g_ar_prescan_n < AR_PRESCAN_MAX) g_ar_prescan_n++;
+            for (uint32_t k = g_ar_prescan_n - 1u; k > pos; k--) g_ar_prescan[k] = g_ar_prescan[k - 1u];
+            g_ar_prescan[pos] = (ar_prescan_cand){ layer, expert, hot, age };
+        }
+    }
+    g_ar_prescan_runs++;
+}
 static int ds4_gpu_stream_expert_cache_take_reusable(
         int                                     force_reuse,
         uint32_t                                protect_layer,
@@ -16469,16 +16518,36 @@ static int ds4_gpu_stream_expert_cache_take_reusable(
     const char *scan = getenv("DS4_ARGODRIVE_LIVE_SCAN");
     const int sparse = scan && strcmp(scan, "0") != 0;
     int waited_inflight = 0;
+    uint32_t pre_layer = UINT32_MAX, pre_expert = UINT32_MAX; /* ARGODRIVE_VICTIM_PRESCAN */
+    if (g_ar_prescan_n && ar_victim_prescan_enabled()) {
+        uint32_t i;
+        for (i = 0; i < g_ar_prescan_n; i++) {
+            const ar_prescan_cand c = g_ar_prescan[i];
+            const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[c.layer][c.expert];
+            if (!ds4_gpu_stream_expert_cache_entry_reusable(e, gate_expert_bytes, down_expert_bytes)) continue;
+            if (ds4_gpu_stream_expert_cache_entry_inflight(e)) continue;
+            if (ds4_gpu_stream_expert_cache_entry_protected(c.layer, c.expert, protect_layer, protect_ids, n_protect)) continue;
+            if (ar_cache_victim_hotness(c.layer, c.expert) != c.hotness || e->last_used != c.last_used) continue;
+            pre_layer = c.layer; pre_expert = c.expert; break;
+        }
+        /* consume this candidate and everything ranked before it */
+        if (pre_layer != UINT32_MAX) {
+            const uint32_t drop = i + 1u;
+            for (uint32_t k = drop; k < g_ar_prescan_n; k++) g_ar_prescan[k - drop] = g_ar_prescan[k];
+            g_ar_prescan_n -= drop; g_ar_prescan_used++;
+        } else { g_ar_prescan_n = 0; g_ar_prescan_fallbacks++; }
+    }
 retry:
     ;
-    uint32_t victim_layer = UINT32_MAX;
-    uint32_t victim_expert = UINT32_MAX;
+    uint32_t victim_layer = pre_layer;
+    uint32_t victim_expert = pre_expert;
     uint32_t lowest_hotness = UINT32_MAX;
     uint64_t oldest = UINT64_MAX;
     int skipped_inflight = 0;
     const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
     const double scan_t0 = timing ? ds4_gpu_now_ms() : 0.0;
     uint64_t scan_entries = 0;
+    if (pre_layer == UINT32_MAX)
     for (uint32_t layer = 0;
          layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
          layer++) {
@@ -16528,6 +16597,7 @@ retry:
                     "streaming expert cache reuse")) {
                 return 0;
             }
+            pre_layer = UINT32_MAX; pre_expert = UINT32_MAX; /* ARGODRIVE_VICTIM_PRESCAN: full scan on retry */
             goto retry;
         }
         return 0;
@@ -17577,6 +17647,24 @@ int ds4_gpu_stream_expert_cache_protect_layer(const void *model_map,
     return (int)marked;
 }
 
+/* 2026-09-28: resident check for the speculative loader (no allocation, no side effects). */
+int ds4_gpu_stream_expert_cache_is_resident(const void *model_map, uint64_t model_size, uint32_t layer, int32_t expert) {
+    if (!g_ssd_streaming_mode || !model_map || expert < 0 ||
+        layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER || (uint32_t)expert >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) return 0;
+    const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][(uint32_t)expert];
+    return e->valid && e->model_map == model_map && e->model_size == model_size;
+}
+/* ARGODRIVE_POST_MOE_FLUSH (2026-09-28): the routed MoE records whether the layer had missing experts;
+ * the graph may then commit the layer's routed work early so the GPU runs it while the CPU encodes on. */
+static uint32_t g_ar_last_missing_mask;
+static uint64_t g_ar_post_moe_flushes;
+int ds4_gpu_argodrive_post_moe_flush(int mode) {
+    if (mode == 2 || (mode == 1 && g_ar_last_missing_mask)) {
+        if (g_batch_cb && g_batch_has_work) { g_ar_post_moe_flushes++; return ds4_gpu_flush_commands(); }
+    }
+    return 1;
+}
+uint64_t ds4_gpu_argodrive_post_moe_flush_count(void) { return g_ar_post_moe_flushes; }
 int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
@@ -18447,28 +18535,34 @@ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
  * shared-expert work into the same batch; finish() commits the batch without waiting, polls
  * the mailbox for the ids (checksum-validated), and starts the miss loads exactly as the
  * end-and-read path does. A 50 ms poll timeout falls back to that path. */
-static id<MTLBuffer> g_ar_ids_box;
-static uint32_t g_ar_ids_seq;
-static uint64_t g_ar_flag_polls, g_ar_flag_fallbacks, g_ar_flag_spin_ns;
+/* Two mailboxes (2026-09-28): box 0 = this layer's router ids, box 1 = the predicted ids for
+ * layer il+1 (ARGODRIVE_DECODE_AHEAD through the mailbox instead of a blocking readback). */
+#define AR_FLAG_BOXES 2u
+static id<MTLBuffer> g_ar_ids_box[AR_FLAG_BOXES];
+static uint32_t g_ar_ids_seq[AR_FLAG_BOXES];
+static int32_t  g_ar_last_ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+static uint32_t g_ar_last_n;
+static uint64_t g_ar_flag_polls, g_ar_flag_fallbacks, g_ar_flag_spin_ns, g_ar_flag_polls1, g_ar_flag_miss1, g_ar_flag_spin1_ns;
 static void ar_flag_report(void) {
-    fprintf(stderr, "ds4: Argodrive flag readback polls=%llu fallbacks=%llu spin_ms=%.1f\n",
-            (unsigned long long)g_ar_flag_polls, (unsigned long long)g_ar_flag_fallbacks, (double)g_ar_flag_spin_ns / 1e6);
+    fprintf(stderr, "ds4: Argodrive flag readback polls=%llu fallbacks=%llu spin_ms=%.1f lookahead_polls=%llu lookahead_timeouts=%llu lookahead_spin_ms=%.1f\n",
+            (unsigned long long)g_ar_flag_polls, (unsigned long long)g_ar_flag_fallbacks, (double)g_ar_flag_spin_ns / 1e6,
+            (unsigned long long)g_ar_flag_polls1, (unsigned long long)g_ar_flag_miss1, (double)g_ar_flag_spin1_ns / 1e6);
 }
-int ds4_gpu_argodrive_flag_readback_begin(const ds4_gpu_tensor *selected, uint32_t n_selected) {
-    if (!g_ssd_streaming_mode || !g_batch_cb || !selected || n_selected == 0 || n_selected > 8u) return 0;
-    if (!g_ar_ids_box) {
-        g_ar_ids_box = [g_device newBufferWithLength:64 options:MTLResourceStorageModeShared];
-        if (!g_ar_ids_box) return 0;
-        memset(g_ar_ids_box.contents, 0, 64);
+int ds4_gpu_argodrive_flag_publish(uint32_t box_index, const ds4_gpu_tensor *selected, uint32_t n_selected) {
+    if (!g_ssd_streaming_mode || !g_batch_cb || !selected || n_selected == 0 || n_selected > 8u || box_index >= AR_FLAG_BOXES) return 0;
+    if (!g_ar_ids_box[box_index]) {
+        g_ar_ids_box[box_index] = [g_device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+        if (!g_ar_ids_box[box_index]) return 0;
+        memset(g_ar_ids_box[box_index].contents, 0, 64);
         static int registered; if (!registered) { registered = 1; atexit(ar_flag_report); }
     }
     id<MTLComputePipelineState> ps = ds4_gpu_get_pipeline("kernel_argodrive_ids_publish");
     if (!ps) return 0;
-    const uint32_t seq = ++g_ar_ids_seq;
+    const uint32_t seq = ++g_ar_ids_seq[box_index];
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
     [enc setComputePipelineState:ps];
     [enc setBuffer:ds4_gpu_tensor_buffer(selected) offset:ds4_gpu_tensor_offset(selected) atIndex:0];
-    [enc setBuffer:g_ar_ids_box offset:0 atIndex:1];
+    [enc setBuffer:g_ar_ids_box[box_index] offset:0 atIndex:1];
     [enc setBytes:&seq length:sizeof(seq) atIndex:2];
     [enc setBytes:&n_selected length:sizeof(n_selected) atIndex:3];
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
@@ -18476,16 +18570,15 @@ int ds4_gpu_argodrive_flag_readback_begin(const ds4_gpu_tensor *selected, uint32
     g_batch_has_work = YES;
     return 1;
 }
-int ds4_gpu_argodrive_flag_readback_finish(const ds4_gpu_stream_expert_table *table,
-                                           const ds4_gpu_tensor *selected, uint32_t n_selected) {
-    g_glm_stream_selected_prefetch.active = 0;
-    if (!table || !selected || n_selected == 0 ||
-        n_selected > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED || !g_ar_ids_box) return 0;
-    if (g_batch_cb && !ds4_gpu_flush_commands()) return 0;
-    int32_t ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
-    for (uint32_t i = 0; i < DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED; i++) ids[i] = -1;
-    volatile uint32_t *box = (volatile uint32_t *)g_ar_ids_box.contents;
-    const uint32_t seq = g_ar_ids_seq;
+int ds4_gpu_argodrive_flag_readback_begin(const ds4_gpu_tensor *selected, uint32_t n_selected) {
+    return ds4_gpu_argodrive_flag_publish(0, selected, n_selected);
+}
+/* Poll one mailbox for the ids published by the most recent publish() on it; no commit, no wait
+ * on the command buffer. Returns 1 with the ids, 0 on timeout or a checksum mismatch. */
+int ds4_gpu_argodrive_flag_poll(uint32_t box_index, int32_t *ids, uint32_t n_selected, uint64_t timeout_ns) {
+    if (box_index >= AR_FLAG_BOXES || !g_ar_ids_box[box_index] || !ids || n_selected == 0 || n_selected > 8u) return 0;
+    volatile uint32_t *box = (volatile uint32_t *)g_ar_ids_box[box_index].contents;
+    const uint32_t seq = g_ar_ids_seq[box_index];
     const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     int got = 0;
     for (;;) {
@@ -18497,16 +18590,36 @@ int ds4_gpu_argodrive_flag_readback_finish(const ds4_gpu_stream_expert_table *ta
                 got = 1; break;
             }
         }
-        if (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0 > 50000000ull) break;
+        if (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0 > timeout_ns) break;
         __asm__ __volatile__("yield");
     }
-    g_ar_flag_spin_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
-    g_ar_flag_polls++;
-    if (!got) {
+    const uint64_t spent = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
+    if (box_index == 0) { g_ar_flag_spin_ns += spent; g_ar_flag_polls++; }
+    else { g_ar_flag_spin1_ns += spent; g_ar_flag_polls1++; if (!got) g_ar_flag_miss1++; }
+    return got;
+}
+int ds4_gpu_argodrive_flag_last_ids(int32_t *out, uint32_t n) {
+    if (!out || !g_ar_last_n || n > g_ar_last_n) return 0;
+    for (uint32_t i = 0; i < n; i++) out[i] = g_ar_last_ids[i];
+    return 1;
+}
+int ds4_gpu_argodrive_flag_readback_finish(const ds4_gpu_stream_expert_table *table,
+                                           const ds4_gpu_tensor *selected, uint32_t n_selected) {
+    g_glm_stream_selected_prefetch.active = 0;
+    g_ar_last_n = 0;
+    if (!table || !selected || n_selected == 0 ||
+        n_selected > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED || !g_ar_ids_box[0]) return 0;
+    if (g_batch_cb && !ds4_gpu_flush_commands()) return 0;
+    ar_victim_prescan(table->gate_expert_bytes, table->down_expert_bytes); /* ARGODRIVE_VICTIM_PRESCAN: work while the GPU runs the router */
+    int32_t ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
+    for (uint32_t i = 0; i < DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED; i++) ids[i] = -1;
+    if (!ds4_gpu_argodrive_flag_poll(0, ids, n_selected, 50000000ull)) {
         g_ar_flag_fallbacks++;
         if (!ds4_gpu_wait_pending_command_buffers("flag readback fallback")) return 0;
         if (!ds4_gpu_tensor_read(selected, 0, ids, (uint64_t)n_selected * sizeof(ids[0]))) return 0;
     }
+    for (uint32_t i = 0; i < n_selected; i++) g_ar_last_ids[i] = ids[i];
+    g_ar_last_n = n_selected;
     if (!ds4_gpu_stream_expert_cache_begin_selected_load(table, ids, n_selected)) return 0;
     ds4_gpu_glm_stream_selected_prefetch_set(table, ids, n_selected);
     return 1;
@@ -41812,6 +41925,7 @@ int ds4_gpu_routed_moe_one_tensor(
         bool stream_expert_split_completed = false;
         uint32_t stream_expert_resident_mask = 0;
         uint32_t stream_expert_missing_mask = 0;
+        g_ar_last_missing_mask = 0; /* ARGODRIVE_POST_MOE_FLUSH */
         uint32_t ar_resident_gate_done = 0;
         uint32_t ar_down_split = 0;
         __unsafe_unretained id<MTLBuffer> gate_group6_bufs[6] = { nil, nil, nil, nil, nil, nil };
@@ -43160,6 +43274,7 @@ int ds4_gpu_routed_moe_one_tensor(
                     ar_resident_gate_done=stream_expert_resident_mask;
                     ar_resident_gate_layers++;
                 }
+                g_ar_last_missing_mask = stream_expert_missing_mask; /* ARGODRIVE_POST_MOE_FLUSH */
                 if (stream_expert_missing_mask != 0 &&
                     !use_stream_expert_split_deferred) {
                     if (ar_rg_requested && !ar_resident_gate_done && g_batch_cb &&

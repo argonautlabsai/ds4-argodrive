@@ -2584,6 +2584,12 @@ int ds4_gpu_add_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a, const 
 void ds4_gpu_argodrive_attn_low_round(int on);
 int ds4_gpu_argodrive_flag_readback_begin(const ds4_gpu_tensor *selected, uint32_t n_selected); /* ARGODRIVE_FLAG_READBACK */
 int ds4_gpu_argodrive_flag_readback_finish(const struct ds4_gpu_stream_expert_table *table, const ds4_gpu_tensor *selected, uint32_t n_selected);
+int ds4_gpu_argodrive_flag_publish(uint32_t box_index, const ds4_gpu_tensor *selected, uint32_t n_selected);
+int ds4_gpu_argodrive_flag_poll(uint32_t box_index, int32_t *ids, uint32_t n_selected, uint64_t timeout_ns);
+int ds4_gpu_argodrive_flag_last_ids(int32_t *out, uint32_t n);
+int ds4_gpu_stream_expert_cache_is_resident(const void *model_map, uint64_t model_size, uint32_t layer, int32_t expert);
+int ds4_gpu_argodrive_post_moe_flush(int mode);
+uint64_t ds4_gpu_argodrive_post_moe_flush_count(void);
 int ds4_gpu_add_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *a,

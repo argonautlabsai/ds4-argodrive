@@ -27,5 +27,18 @@ class StackProfileTests(unittest.TestCase):
             self.assertTrue(ds41_fork_profile('/primary', replicas, 'v41-stack-20260927')['errors'])
 
 
+class Stack0928ProfileTests(unittest.TestCase):
+    EXTRA = {'DS4_ARGODRIVE_POST_MOE_FLUSH': '1', 'DS4_ARGODRIVE_VICTIM_PRESCAN': '1'}
+
+    def test_profile_extends_the_stack_profile_only(self):
+        old = ds41_fork_profile('/primary', ['/one', '/two'], 'v41-stack-20260927')
+        new = ds41_fork_profile('/primary', ['/one', '/two'], 'v41-stack-20260928')
+        self.assertFalse(new['errors'])
+        self.assertEqual(new['environment'], {**old['environment'], **self.EXTRA})
+        self.assertEqual(new['cache_experts'], 4600)
+        for key in self.EXTRA:
+            self.assertNotIn(key, old['environment'])
+
+
 if __name__ == '__main__':
     unittest.main()

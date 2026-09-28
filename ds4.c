@@ -39840,15 +39840,22 @@ static uint32_t g_ar_la_real_n;
 static uint64_t g_ar_la_issued;
 static uint64_t g_ar_la_layers, g_ar_la_hits, g_ar_la_hist[DS4_MAX_EXPERT_USED + 1];
 static uint64_t g_ar_la_layer_n[AR_LA_MAX_LAYER], g_ar_la_layer_hits[AR_LA_MAX_LAYER];
+static uint64_t g_ar_la_skipped_resident;
+static int ar_decode_ahead_missing_only(void) {
+    static int checked, on;
+    if (!checked) { const char *e = getenv("DS4_ARGODRIVE_DECODE_AHEAD_MISSING_ONLY"); on = e && strcmp(e, "0") != 0; checked = 1; }
+    return on;
+}
 static int ar_la_probe_enabled(void) {
     static int checked, on;
     if (!checked) { const char *e = getenv("DS4_ARGODRIVE_LOOKAHEAD_PROBE"); on = e && strcmp(e, "0") != 0; checked = 1; }
     return on;
 }
 static void ar_la_probe_report(void) {
-    if (g_ar_la_issued)
-        fprintf(stderr, "ds4: V4.1 decode read-ahead: speculative loads issued=%llu\n",
-                (unsigned long long)g_ar_la_issued);
+    if (g_ar_la_issued || g_ar_la_skipped_resident)
+        fprintf(stderr, "ds4: V4.1 decode read-ahead: speculative loads issued=%llu skipped_all_resident=%llu post_moe_flushes=%llu\n",
+                (unsigned long long)g_ar_la_issued, (unsigned long long)g_ar_la_skipped_resident,
+                (unsigned long long)ds4_gpu_argodrive_post_moe_flush_count());
     if (!g_ar_la_layers) return;
     fprintf(stderr, "ds4: V4.1 router lookahead probe: layers=%llu mean_overlap=%.2f/%u hist=",
             (unsigned long long)g_ar_la_layers,
@@ -39944,6 +39951,18 @@ static void ar_la_take(ds41_gpu_graph *g, uint32_t il) {
             (uint64_t)DS4_N_EXPERT_USED * sizeof(g_ar_la_pred[0])) == 0) return;
     g_ar_la_have = 1; g_ar_la_pending = (int)(il + 1u);
 }
+/* ARGODRIVE_DECODE_AHEAD through the mailbox (2026-09-28): after flag_readback_finish() has
+ * started this layer's demand reads, take the prediction for il+1 from mailbox 1 (encoded into
+ * the same command buffer right after mailbox 0) and this layer's real ids from finish(). No
+ * blocking readback, no drain. A missing or late mailbox simply skips the prediction. */
+static void ar_la_take_mailbox(uint32_t il, int published) {
+    g_ar_la_have = 0; g_ar_la_pending = -1;
+    g_ar_la_real_n = ds4_gpu_argodrive_flag_last_ids(g_ar_la_real, DS4_N_EXPERT_USED) ? DS4_N_EXPERT_USED : 0;
+    if (!published || !g_ar_la_encoded) return;
+    for (uint32_t i = 0; i < DS4_MAX_EXPERT_USED; i++) g_ar_la_pred[i] = -1;
+    if (!ds4_gpu_argodrive_flag_poll(1, g_ar_la_pred, DS4_N_EXPERT_USED, 3000000ull)) return;
+    g_ar_la_have = 1; g_ar_la_pending = (int)(il + 1u);
+}
 /* Issue the predicted reads for layer il+1 once this layer's demand load has been
  * consumed, so they run while the GPU computes this layer's MoE. If the prediction
  * is wrong the next layer's clear() installs whatever landed and re-reads the rest;
@@ -39972,7 +39991,19 @@ static void ar_la_issue(ds41_gpu_graph *g, const ds4_model *m, uint32_t il) {
     if (g_ar_la_real_n)
         (void)ds4_gpu_stream_expert_cache_protect_layer(m->map, m->size, il,
                                                         g_ar_la_real, g_ar_la_real_n);
-    if (ds4_gpu_stream_expert_cache_begin_selected_load(&nt, g_ar_la_pred, ar_decode_ahead_k()))
+    int32_t want[DS4_MAX_EXPERT_USED]; uint32_t n_want = 0;
+    if (ar_decode_ahead_missing_only()) {
+        /* Only predicted experts that are not resident, most confident first: the popular experts are
+         * cached already, so speculative reads should target the likely misses. */
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED && n_want < ar_decode_ahead_k(); i++)
+            if (g_ar_la_pred[i] >= 0 && !ds4_gpu_stream_expert_cache_is_resident(m->map, m->size, il + 1u, g_ar_la_pred[i]))
+                want[n_want++] = g_ar_la_pred[i];
+        if (!n_want) { g_ar_la_skipped_resident++; return; }
+    } else {
+        n_want = ar_decode_ahead_k();
+        for (uint32_t i = 0; i < n_want; i++) want[i] = g_ar_la_pred[i];
+    }
+    if (ds4_gpu_stream_expert_cache_begin_selected_load(&nt, want, n_want))
         g_ar_la_issued++;
 }
 #endif
@@ -40008,6 +40039,11 @@ static int ar_flag_readback(void) {
     if (!checked) { const char *e = getenv("DS4_ARGODRIVE_FLAG_READBACK"); on = e && strcmp(e, "0") != 0; checked = 1; }
     return on;
 }
+static int ar_post_moe_flush_mode(void) {
+    static int checked, mode;
+    if (!checked) { const char *e = getenv("DS4_ARGODRIVE_POST_MOE_FLUSH"); mode = e ? atoi(e) : 0; if (mode < 0 || mode > 2) mode = 0; checked = 1; }
+    return mode;
+}
 static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
     uint64_t gate_row = 0, down_row = 0;
@@ -40039,17 +40075,26 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
             .down_expert_bytes=down_row * DS4_N_EMBD,
         };
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        const bool ar_flag_path = ar_flag_readback() && !ar_la_probe_enabled();
         /* Predict layer il+1 into the batch that is still open, so the result is
          * carried by the drain the load below performs rather than a new one. */
-        if (ar_la_active()) ar_la_encode(g, m, il, token);
+        if (ar_la_active() && !ar_flag_path) ar_la_encode(g, m, il, token);
 #endif
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-        if (ar_flag_readback() && !ar_la_active() &&
+        if (ar_flag_path &&
             ds4_gpu_argodrive_flag_readback_begin(g->selected, DS4_N_EXPERT_USED)) {
-            /* ARGODRIVE_FLAG_READBACK: shared expert into the same buffer, then commit and poll. */
+            /* ARGODRIVE_FLAG_READBACK: shared expert into the same buffer, then commit and poll.
+             * ARGODRIVE_DECODE_AHEAD: the prediction for il+1 rides behind mailbox 0 in the same buffer. */
+            int la_published = 0;
+            if (ar_decode_ahead_enabled() && ar_la_layer_worth_it(il + 1u)) {
+                ar_la_encode(g, m, il, token);
+                if (g_ar_la_encoded && g_ar_la_selected)
+                    la_published = ds4_gpu_argodrive_flag_publish(1, g_ar_la_selected, DS4_N_EXPERT_USED);
+            } else g_ar_la_encoded = 0;
             if (!ds41_shared_expert(g, m, l, il, shared_owner)) return false;
             ar_shared_done = true;
             if (!ds4_gpu_argodrive_flag_readback_finish(&table, g->selected, DS4_N_EXPERT_USED)) return false;
+            if (ar_decode_ahead_enabled()) ar_la_take_mailbox(il, la_published);
         } else
 #endif
         if (!ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
@@ -40057,7 +40102,7 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
         /* The load above ended the batch, so this layer's real selection and the
          * prediction encoded above are both readable here without a new drain. */
-        if (ar_la_active()) ar_la_take(g, il);
+        if (ar_la_active() && !ar_shared_done) ar_la_take(g, il);
 #endif
     }
     if (!ar_shared_done && !ds41_shared_expert(g, m, l, il, shared_owner)) return false;
@@ -40078,12 +40123,21 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
     if (shared_owner && g->tp_rank == (il & 1u) &&
         !ds4_gpu_add_tensor(routed, routed, g->shared, DS4_N_EMBD)) return false;
     if (!ds41_sum_partial(g, routed, il, DS4_TP_GATE_FFN)) return false;
+    bool moe_ok;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     if (!shared_owner && ar_bf16_epilogues())
-        return ds4_gpu_add_bf16_tensor(g->block, routed, g->shared, DS4_N_EMBD) != 0; /* ARGODRIVE_BF16_EPILOGUES */
+        moe_ok = ds4_gpu_add_bf16_tensor(g->block, routed, g->shared, DS4_N_EMBD) != 0; /* ARGODRIVE_BF16_EPILOGUES */
+    else
 #endif
-    return (shared_owner || ds4_gpu_add_tensor(g->block, routed, g->shared, DS4_N_EMBD)) &&
+    moe_ok = (shared_owner || ds4_gpu_add_tensor(g->block, routed, g->shared, DS4_N_EMBD)) &&
         ds41_bf16(g->block, DS4_N_EMBD);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* ARGODRIVE_POST_MOE_FLUSH (2026-09-28): commit this layer's routed work now so the GPU runs it while
+     * the CPU encodes the next layer's attention. Mode 1: only after a layer that waited for reads. */
+    if (moe_ok && g->streaming && g->tp_world == 1 && ar_post_moe_flush_mode() &&
+        !ds4_gpu_argodrive_post_moe_flush(ar_post_moe_flush_mode())) return false;
+#endif
+    return moe_ok;
 }
 
 static bool ds41_graph_logits_in_batch(ds41_gpu_graph *g, const ds4_model *m,
