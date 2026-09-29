@@ -2587,6 +2587,15 @@ int ds4_gpu_argodrive_flag_readback_finish(const struct ds4_gpu_stream_expert_ta
 int ds4_gpu_argodrive_flag_publish(uint32_t box_index, const ds4_gpu_tensor *selected, uint32_t n_selected);
 int ds4_gpu_argodrive_flag_poll(uint32_t box_index, int32_t *ids, uint32_t n_selected, uint64_t timeout_ns);
 int ds4_gpu_argodrive_flag_last_ids(int32_t *out, uint32_t n);
+/* ARGODRIVE_GPU_GATHER */
+int ds4_gpu_argodrive_routed_moe_deferred(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
+        const struct ds4_gpu_stream_expert_table *table, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_expert, float clamp, const ds4_gpu_tensor *x,
+        uint32_t gate_type, uint32_t down_type, uint64_t gate_row_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim);
+int ds4_gpu_argodrive_gather_phase2(void);
+int ds4_gpu_argodrive_gather_drain(void);
 int ds4_gpu_stream_expert_cache_is_resident(const void *model_map, uint64_t model_size, uint32_t layer, int32_t expert);
 int ds4_gpu_argodrive_post_moe_flush(int mode);
 uint64_t ds4_gpu_argodrive_post_moe_flush_count(void);

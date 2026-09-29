@@ -39191,6 +39191,7 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(shared_gate, DS4_N_FF_EXP) X(shared_up, DS4_N_FF_EXP) \
     X(shared_mid, DS4_N_FF_EXP) X(shared, DS4_N_EMBD) \
     X(engram_rows, DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
+    X(engram_rows_b, DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
     X(engram_prefetch, (g->carry_cap ? g->carry_cap : g->prefill_cap) * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
     X(engram_kv, (DS4_N_HC + 1u) * DS4_N_EMBD) X(logits, DS4_N_VOCAB)
 
@@ -40039,6 +40040,11 @@ static int ar_flag_readback(void) {
     if (!checked) { const char *e = getenv("DS4_ARGODRIVE_FLAG_READBACK"); on = e && strcmp(e, "0") != 0; checked = 1; }
     return on;
 }
+static int ar_gpu_gather(void) {
+    static int checked, on;
+    if (!checked) { const char *e = getenv("DS4_ARGODRIVE_GPU_GATHER"); on = e && strcmp(e, "0") != 0; checked = 1; }
+    return on;
+}
 static int ar_post_moe_flush_mode(void) {
     static int checked, mode;
     if (!checked) { const char *e = getenv("DS4_ARGODRIVE_POST_MOE_FLUSH"); mode = e ? atoi(e) : 0; if (mode < 0 || mode > 2) mode = 0; checked = 1; }
@@ -40053,6 +40059,7 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     bool ar_shared_done = false; /* ARGODRIVE_FLAG_READBACK */
+    bool ar_routed_done = false; /* ARGODRIVE_GPU_GATHER */
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
     if (!bias) return false;
     if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) ||
@@ -40093,8 +40100,17 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
             } else g_ar_la_encoded = 0;
             if (!ds41_shared_expert(g, m, l, il, shared_owner)) return false;
             ar_shared_done = true;
+            const bool ar_gather = ar_gpu_gather() && !ar_la_active();
+            /* ARGODRIVE_GPU_GATHER: commit this layer's work, then join the previous layer's deferred miss
+             * reads (which lets the GPU run on to this layer's router), then take this layer's ids. */
+            if (ar_gather && !ds4_gpu_flush_commands()) return false; /* drains (joins + commits) the held batch first */
             if (!ds4_gpu_argodrive_flag_readback_finish(&table, g->selected, DS4_N_EXPERT_USED)) return false;
             if (ar_decode_ahead_enabled()) ar_la_take_mailbox(il, la_published);
+            if (ar_gather && ds4_gpu_argodrive_routed_moe_deferred(routed, g->gate, g->up, g->mid, &table, g->selected,
+                    g->route_weights, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->norm,
+                    l->ffn_gate_exps->type, l->ffn_down_exps->type, gate_row, down_row,
+                    DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD))
+                ar_routed_done = true;
         } else
 #endif
         if (!ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
@@ -40106,7 +40122,7 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
 #endif
     }
     if (!ar_shared_done && !ds41_shared_expert(g, m, l, il, shared_owner)) return false;
-    if (!ds4_gpu_routed_moe_one_tensor(routed, g->gate, g->up, g->mid, g->experts,
+    if (!ar_routed_done && !ds4_gpu_routed_moe_one_tensor(routed, g->gate, g->up, g->mid, g->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
             gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
@@ -40134,7 +40150,7 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* ARGODRIVE_POST_MOE_FLUSH (2026-09-28): commit this layer's routed work now so the GPU runs it while
      * the CPU encodes the next layer's attention. Mode 1: only after a layer that waited for reads. */
-    if (moe_ok && g->streaming && g->tp_world == 1 && ar_post_moe_flush_mode() &&
+    if (moe_ok && g->streaming && g->tp_world == 1 && ar_post_moe_flush_mode() && !ar_routed_done &&
         !ds4_gpu_argodrive_post_moe_flush(ar_post_moe_flush_mode())) return false;
 #endif
     return moe_ok;
@@ -40156,11 +40172,23 @@ static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
     return ds41_graph_logits_in_batch(g, m, w, logits, false);
 }
 
+static int ar_early_flush(void) {
+    static int checked, on;
+    if (!checked) { const char *e = getenv("DS4_ARGODRIVE_EARLY_FLUSH"); on = e && strcmp(e, "0") != 0; checked = 1; }
+    return on;
+}
+static int ar_engram_rows_split(void) {
+    static int checked, on;
+    if (!checked) { const char *e = getenv("DS4_ARGODRIVE_ENGRAM_ROWS_SPLIT"); on = e && strcmp(e, "0") != 0; checked = 1; }
+    return on;
+}
 static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                                        const ds4_layer_weights *l, uint32_t il) {
     if (ds41_engram_layer(il) && !ds41_image_at(g, g->pos)) {
         const uint32_t i = il == 1 ? 0 : 1;
-        if (!ds41_matmul(g->engram_kv, m, l->engram_kv, g->engram_rows, true) ||
+        /* ARGODRIVE_ENGRAM_ROWS_SPLIT: table 1 reads its own buffer, so no drain is needed before its write. */
+        const ds4_gpu_tensor *rows = (i == 1 && ar_engram_rows_split() && g->engram_rows_b) ? g->engram_rows_b : g->engram_rows;
+        if (!ds41_matmul(g->engram_kv, m, l->engram_kv, rows, true) ||
             !ds4_gpu_dsv41_engram_add(g->residual, g->engram_kv,
                 g->engram_q_norm[i], g->engram_k_norm[i], NULL, DS4_N_EMBD, 1, DS4_RMS_EPS))
             return false;
@@ -40706,17 +40734,27 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             const uint32_t i = il == 1 ? 0 : 1;
             AR_ENGRAM_JOIN();
             if (!ar_eg_ok) ok = false;
-            if (ok) ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
+            if (ok) ok = ds4_gpu_tensor_write((i == 1 && ar_engram_rows_split() && g->engram_rows_b) ? g->engram_rows_b : g->engram_rows,
+                                              0, g->rows[i], sizeof(g->rows[i]));
         }
         double ar_mark = ar_profile ? now_sec() : 0;
         if (ok) ok = ds41_graph_layer(g, m, l, il, token);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        /* ARGODRIVE_EARLY_FLUSH: layer 0 is dense, so nothing reaches the GPU before layer 1's router commit;
+         * commit the embed and layer 0 now and let the GPU run them while layer 1 is encoded. */
+        if (ok && il == 0 && ar_early_flush() && queue_layers && g->streaming && g->tp_world == 1 &&
+            ds4_gpu_commands_active() && !ds4_gpu_flush_commands()) ok = false;
+#endif
         if (ar_profile) ar_time.layer += now_sec() - ar_mark;
         /* TP gates already submit ordered, bounded command buffers. Drain
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
-        const bool drain = !queue_layers || il == 13 ||
+        const bool drain = !queue_layers || (il == 13 && !(ar_engram_rows_split() && g->engram_rows_b)) ||
             (il + 1u == DS4_N_LAYER && !append_logits);
         if (ar_profile) ar_mark = now_sec();
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        if (ok && drain && !ds4_gpu_argodrive_gather_drain()) ok = false; /* ARGODRIVE_GPU_GATHER */
+#endif
         if (drain && !ds4_gpu_end_commands()) ok = false;
         if (ar_profile) ar_time.drain += now_sec() - ar_mark;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
@@ -40732,6 +40770,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     // The output head consumes GPU buffers only. When enabled, append it to
     // the last layer's batch and drain once before publishing logits. Errors
     // and calls without logits retain the original completion boundary.
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (!ds4_gpu_argodrive_gather_drain()) ok = false; /* ARGODRIVE_GPU_GATHER */
+#endif
     if (ds4_gpu_commands_active() && (!ok || !append_logits) &&
         !ds4_gpu_end_commands()) ok = false;
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;

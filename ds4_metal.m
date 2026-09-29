@@ -1749,7 +1749,9 @@ static int ds4_gpu_stream_expert_cache_mark_entries_inflight(
 
 static int ds4_gpu_stream_expert_cache_wait_inflight(const char *label);
 
+int ds4_gpu_argodrive_gather_drain(void); /* ARGODRIVE_GPU_GATHER */
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
+    (void)ds4_gpu_argodrive_gather_drain(); /* ARGODRIVE_GPU_GATHER: commit a held routed batch before waiting */
     int ok = 1;
     for (id<MTLCommandBuffer> pending in g_pending_cbs) {
         if (!ds4_gpu_wait_command_buffer(pending, label)) ok = 0;
@@ -1767,6 +1769,7 @@ static void ds4_gpu_queue_keepalive_stop_thread(void);
 static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, const char *label) {
     if (!owned) return 1;
 
+    (void)ds4_gpu_argodrive_gather_drain(); /* ARGODRIVE_GPU_GATHER: a held routed batch goes first */
     const double t_commit = ds4_gpu_now_ms();
     [cb commit];
     int ok = ds4_gpu_wait_pending_command_buffers(label);
@@ -9739,10 +9742,12 @@ int ds4_gpu_flush_encoder(void) {
     return 1;
 }
 
+int ds4_gpu_argodrive_gather_drain(void);
 int ds4_gpu_flush_commands(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     ds4_gpu_parallel_ffn_reset_state(YES);
     if (!g_batch_cb) return 0;
+    (void)ds4_gpu_argodrive_gather_drain(); /* ARGODRIVE_GPU_GATHER: a held routed batch goes first */
 
     ds4_gpu_close_batch_encoder();
     id<MTLCommandBuffer> cb = g_batch_cb;
@@ -18609,7 +18614,7 @@ int ds4_gpu_argodrive_flag_readback_finish(const ds4_gpu_stream_expert_table *ta
     g_ar_last_n = 0;
     if (!table || !selected || n_selected == 0 ||
         n_selected > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED || !g_ar_ids_box[0]) return 0;
-    if (g_batch_cb && !ds4_gpu_flush_commands()) return 0;
+    if (g_batch_cb && g_batch_has_work && !ds4_gpu_flush_commands()) return 0;
     ar_victim_prescan(table->gate_expert_bytes, table->down_expert_bytes); /* ARGODRIVE_VICTIM_PRESCAN: work while the GPU runs the router */
     int32_t ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
     for (uint32_t i = 0; i < DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED; i++) ids[i] = -1;
@@ -41803,6 +41808,174 @@ static bool ds4_gpu_mxfp4_moe_decode_nsg1_enabled(uint32_t n_tokens) {
            getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_DECODE_NSG1") == NULL;
 }
 
+
+/* ARGODRIVE_SLOTS6_NSG (2026-09-29): SIMD groups per threadgroup for the fused six-expert Q4_K kernels.
+ * Per-row arithmetic and the six-slot accumulation order are untouched (each row is one SIMD group), so
+ * the output is bit-identical for any value; only occupancy changes. Default 2 = the shipped geometry. */
+static int ar_slots6_nsg(void) {
+    static int c = 0;
+    if (!c) { const char *e = getenv("DS4_ARGODRIVE_SLOTS6_NSG"); int v = e ? atoi(e) : 2; c = (v == 1 || v == 2 || v == 4 || v == 8) ? v : 2; }
+    return c;
+}
+/* ---- ARGODRIVE_GPU_GATHER (2026-09-29): deferred join ---------------------------------------------
+ * With flag readback the CPU learns the router ids, starts the miss reads, then blocks until they land
+ * before it can encode the routed MoE and everything after it; the GPU idles for the read and for that
+ * encode. Here the routed MoE is encoded immediately, binding the six explicit slabs (the loader assigns
+ * the missing experts' slabs when the reads start), behind a GPU wait on a shared event. The next layer
+ * is then encoded and committed, and only afterwards are this layer's reads joined and the event
+ * signalled. Layers without misses encode no wait and behave exactly as before. Off unless
+ * DS4_ARGODRIVE_GPU_GATHER=1. Output is bit-identical: same kernels, same buffers, same order. */
+static int ar_gather_enabled(void) {
+    static int c = -1;
+    if (c < 0) { const char *e = getenv("DS4_ARGODRIVE_GPU_GATHER"); c = e && strcmp(e, "0") != 0; }
+    return c;
+}
+static uint64_t g_ar_gather_layers, g_ar_gather_miss_layers, g_ar_gather_join_ns, g_ar_gather_fallbacks;
+typedef struct {
+    int active, draining;
+    __strong id<MTLCommandBuffer> held; /* routed MoE of the pending layer, committed after the join */
+    ds4_gpu_stream_expert_table table;
+    int32_t ids[8];
+    uint32_t n, missing_mask;
+    uint64_t gate_abs[8], up_abs[8], down_abs[8];
+    ds4_gpu_stream_expert_cache_entry *entries[8];
+} ar_gather_pending;
+static ar_gather_pending g_ar_gather_pending;
+static void ar_gather_report(void) {
+    fprintf(stderr, "ds4: Argodrive GPU gather layers=%llu miss_layers=%llu deferred_join_ms=%.1f fallbacks=%llu\n",
+            (unsigned long long)g_ar_gather_layers, (unsigned long long)g_ar_gather_miss_layers,
+            (double)g_ar_gather_join_ns / 1e6, (unsigned long long)g_ar_gather_fallbacks);
+}
+/* Join the pending layer's miss reads, install them, mark them in flight, then commit the held command
+ * buffer that carries the layer's routed MoE. Everything encoded after it (the layer's tail, the next
+ * layer) sits in the batch the caller commits next, so queue order is preserved without a GPU-side wait. */
+int ds4_gpu_argodrive_gather_phase2(void) {
+    ar_gather_pending *pend = &g_ar_gather_pending;
+    if (!pend->active || pend->draining) return 1;
+    pend->draining = 1;
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    int ok = ds4_gpu_stream_expert_cache_load_selected_missing(pend->table.model_map, pend->table.model_size, pend->table.layer,
+            pend->ids, pend->table.n_total_expert, pend->n, pend->gate_abs, pend->up_abs, pend->down_abs,
+            pend->table.gate_expert_bytes, pend->table.down_expert_bytes, pend->missing_mask, pend->entries);
+    if (ok) ok = ds4_gpu_stream_expert_cache_mark_entries_inflight(pend->entries, pend->n, pend->missing_mask);
+    g_ar_gather_join_ns += clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0;
+    if (pend->held) {
+        [pend->held commit];
+        [g_pending_cbs addObject:pend->held];
+        pend->held = nil;
+    }
+    pend->active = 0; pend->draining = 0;
+    return ok;
+}
+int ds4_gpu_argodrive_gather_drain(void) { return ds4_gpu_argodrive_gather_phase2(); }
+/* Encode this layer's routed MoE now, from the ids the mailbox delivered and the slabs the loader assigned.
+ * Returns 0 (nothing encoded) when the layer does not fit the deferred path; the caller then takes the
+ * ordinary joining path. */
+int ds4_gpu_argodrive_routed_moe_deferred(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
+        const ds4_gpu_stream_expert_table *table, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_expert, float clamp, const ds4_gpu_tensor *x,
+        uint32_t gate_type, uint32_t down_type, uint64_t gate_row_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim) {
+    ar_gather_pending *pend = &g_ar_gather_pending;
+    if (!ar_gather_enabled() || !g_batch_cb || !table || !out || !gate || !up || !mid || !selected || !weights || !x ||
+        pend->active || n_expert != 6u || g_tp_split_world != 1 || g_quality_mode || g_ar_last_n != n_expert ||
+        gate_type != DS4_METAL_TENSOR_Q4_K || down_type != DS4_METAL_TENSOR_Q4_K ||
+        !g_moe_mul_mv_slots6_q4_k_pair_swiglu_pipeline || !g_moe_mul_mv_slots6_q4_k_sum6_pipeline ||
+        getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") || getenv("DS4_ARGODRIVE_Q4_PAIR_LOADS") ||
+        table->layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) { g_ar_gather_fallbacks++; return 0; }
+    static int registered; if (!registered) { registered = 1; atexit(ar_gather_report); }
+    int32_t ids[8]; for (uint32_t i = 0; i < 8; i++) ids[i] = -1;
+    if (!ds4_gpu_argodrive_flag_last_ids(ids, n_expert)) { g_ar_gather_fallbacks++; return 0; }
+    id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out), gatebuf = ds4_gpu_tensor_buffer(gate), upbuf = ds4_gpu_tensor_buffer(up),
+                  midbuf = ds4_gpu_tensor_buffer(mid), weightsbuf = ds4_gpu_tensor_buffer(weights), xbuf = ds4_gpu_tensor_buffer(x);
+    if (!outbuf || !gatebuf || !upbuf || !midbuf || !weightsbuf || !xbuf) { g_ar_gather_fallbacks++; return 0; }
+    uint64_t gate_abs[8] = {0}, up_abs[8] = {0}, down_abs[8] = {0};
+    for (uint32_t i = 0; i < n_expert; i++) {
+        if (ids[i] < 0 || (uint32_t)ids[i] >= table->n_total_expert) { g_ar_gather_fallbacks++; return 0; }
+        const uint64_t e = (uint64_t)(uint32_t)ids[i];
+        gate_abs[i] = table->gate_offset + e * table->gate_expert_bytes;
+        up_abs[i] = table->up_offset + e * table->gate_expert_bytes;
+        down_abs[i] = table->down_offset + e * table->down_expert_bytes;
+    }
+    /* Same bookkeeping the joining path performs before it binds the slabs. */
+    ds4_gpu_stream_expert_cache_note_selected_hotness(table->layer, ids, n_expert);
+    if (!ds4_gpu_moe_selected_trace_record(ids, n_expert) ||
+        !ds4_gpu_moe_selected_hotlist_record(table->layer, ids, n_expert, table->n_total_expert)) { g_ar_gather_fallbacks++; return 0; }
+    __unsafe_unretained id<MTLBuffer> gate_bufs[6], up_bufs[6], down_bufs[6];
+    NSUInteger gate_offs[6], up_offs[6], down_offs[6];
+    ds4_gpu_stream_expert_cache_entry *entries[8] = {NULL};
+    uint32_t resident_mask = 0, missing_mask = 0;
+    const ds4_gpu_stream_expert_pending_load *pl = &g_stream_expert_pending_load;
+    for (uint32_t i = 0; i < n_expert; i++) {
+        ds4_gpu_stream_expert_cache_entry *entry = ds4_gpu_stream_expert_cache_peek(table->model_map, table->model_size, table->layer,
+                (uint32_t)ids[i], table->n_total_expert, n_expert, gate_abs[i], up_abs[i], down_abs[i],
+                table->gate_expert_bytes, table->down_expert_bytes);
+        if (entry) {
+            entries[i] = entry; resident_mask |= 1u << i;
+            gate_bufs[i] = entry->gate_buffer; gate_offs[i] = entry->gate_inner;
+            up_bufs[i] = entry->up_buffer; up_offs[i] = entry->up_inner;
+            down_bufs[i] = entry->down_buffer; down_offs[i] = entry->down_inner;
+            continue;
+        }
+        /* Missing: the loader started this read in begin_selected_load() and already owns a slab for it. */
+        if (!pl->active || pl->layer != table->layer || pl->model_map != table->model_map || pl->n_selected != n_expert ||
+            pl->selected_ids[i] != ids[i] || (pl->missing_mask & (1u << i)) == 0) { g_ar_gather_fallbacks++; return 0; }
+        const uint32_t source = pl->source_slots[i] < n_expert ? pl->source_slots[i] : i;
+        uint32_t load_i = UINT32_MAX;
+        for (uint32_t k = 0; k < pl->n_loads; k++) if (pl->load_slots[k] == source) { load_i = k; break; }
+        if (load_i == UINT32_MAX || !pl->gate_bufs[load_i] || !pl->up_bufs[load_i] || !pl->down_bufs[load_i]) { g_ar_gather_fallbacks++; return 0; }
+        gate_bufs[i] = pl->gate_bufs[load_i]; gate_offs[i] = pl->gate_inners[load_i];
+        up_bufs[i] = pl->up_bufs[load_i]; up_offs[i] = pl->up_inners[load_i];
+        down_bufs[i] = pl->down_bufs[load_i]; down_offs[i] = pl->down_inners[load_i];
+        missing_mask |= 1u << i;
+    }
+    if (resident_mask && !ds4_gpu_stream_expert_cache_mark_entries_inflight(entries, n_expert, resident_mask)) { g_ar_gather_fallbacks++; return 0; }
+    /* The routed MoE must be the only work in the batch when it is held: the caller flushed before the
+     * mailbox poll, and nothing is encoded between that flush and this call. */
+    if (missing_mask && g_batch_has_work) { g_ar_gather_fallbacks++; return 0; }
+    g_ar_gather_layers++;
+    const uint32_t nr0 = ds4_gpu_routed_mv_nr0(DS4_METAL_TENSOR_Q4_K);
+    ds4_gpu_mul_mv_id_args gate_args = ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, table->n_total_expert,
+            gate_row_bytes, table->gate_expert_bytes, 1, n_expert, 1, nr0);
+    ds4_gpu_mul_mv_id_args down_args = ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, table->n_total_expert,
+            down_row_bytes, table->down_expert_bytes, n_expert, n_expert, 1, nr0);
+    gate_args.tp_rank = 0; gate_args.tp_world = 1; gate_args.tp_expert_base = 0;
+    down_args.tp_rank = 0; down_args.tp_world = 1; down_args.tp_addend = 0; down_args.tp_expert_base = 0;
+    const ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
+        .width = expert_mid_dim, .rows = n_expert,
+        .gate_row_stride = (uint64_t)expert_mid_dim * sizeof(float), .up_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+        .mid_row_stride = (uint64_t)expert_mid_dim * sizeof(float), .weight_stride = sizeof(float),
+        .write_clamped = 0, .clamp_value = clamp,
+    };
+    const NSUInteger gate_smem = ds4_gpu_routed_mv_smem(DS4_METAL_TENSOR_Q4_K);
+    const NSUInteger down_smem = ds4_gpu_routed_mv_smem(DS4_METAL_TENSOR_Q4_K);
+    if (!ds4_gpu_encode_mul_mv_slots6_pair_swiglu(g_batch_cb, g_moe_mul_mv_slots6_q4_k_pair_swiglu_pipeline, &gate_args, &act_args,
+            gate_bufs, gate_offs, up_bufs, up_offs, xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
+            upbuf, ds4_gpu_tensor_offset(up), midbuf, ds4_gpu_tensor_offset(mid), weightsbuf, ds4_gpu_tensor_offset(weights),
+            gate_smem, 2, false, 0u) ||
+        !ds4_gpu_encode_mul_mv_slots6_sum6(g_batch_cb, g_moe_mul_mv_slots6_q4_k_sum6_pipeline, &down_args, down_bufs, down_offs,
+            midbuf, ds4_gpu_tensor_offset(mid), outbuf, ds4_gpu_tensor_offset(out), down_smem, 2)) {
+        return 0;
+    }
+    if (missing_mask) {
+        /* Hold this batch (routed MoE only) until the reads land; open a fresh batch for what follows. */
+        ds4_gpu_close_batch_encoder();
+        id<MTLCommandBuffer> held = g_batch_cb;
+        ds4_gpu_stream_expert_cache_note_batch_committed();
+        g_batch_cb = ds4_gpu_new_command_buffer();
+        g_batch_has_work = NO;
+        if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
+        ds4_gpu_timeline_attach(g_batch_cb);
+        if (!g_batch_cb) { [held commit]; [g_pending_cbs addObject:held]; return 0; }
+        memset(pend, 0, sizeof(*pend));
+        pend->active = 1; pend->held = held; pend->table = *table; pend->n = n_expert; pend->missing_mask = missing_mask;
+        for (uint32_t i = 0; i < n_expert; i++) { pend->ids[i] = ids[i]; pend->gate_abs[i] = gate_abs[i]; pend->up_abs[i] = up_abs[i]; pend->down_abs[i] = down_abs[i]; pend->entries[i] = entries[i]; }
+        g_ar_gather_miss_layers++;
+    }
+    return 1;
+}
+
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -43250,7 +43423,7 @@ int ds4_gpu_routed_moe_one_tensor(
                             rg_gate,rg_gate_off,rg_up,rg_up_off,
                             xbuf,ds4_gpu_tensor_offset(x),gatebuf,ds4_gpu_tensor_offset(gate),
                             upbuf,ds4_gpu_tensor_offset(up),midbuf,ds4_gpu_tensor_offset(mid),
-                            weightsbuf,ds4_gpu_tensor_offset(weights),gate_smem,2,false,
+                            weightsbuf,ds4_gpu_tensor_offset(weights),gate_smem,(NSUInteger)ar_slots6_nsg(),false,
                             stream_expert_resident_mask)) return 0;
                     if (ar_rd_requested && (stream_expert_resident_mask & 1u)) {
                         // Stop at the first missing slot. Computing arbitrary cached slots
@@ -43266,9 +43439,9 @@ int ds4_gpu_routed_moe_one_tensor(
                             rd_down[i]=down_slot_bufs[j];rd_off[i]=down_slot_offsets[j];
                         }
                         if (!ds4_gpu_encode_mul_mv_slots6_continuation(g_batch_cb,
-                                ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_slots6_q4_K_prefix_f32",2),
+                                ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_slots6_q4_K_prefix_f32",(int16_t)ar_slots6_nsg()),
                                 &down_args,rd_down,rd_off,midbuf,ds4_gpu_tensor_offset(mid),
-                                outbuf,ds4_gpu_tensor_offset(out),down_smem,2,g_ar_down_carry,ar_down_split)) return 0;
+                                outbuf,ds4_gpu_tensor_offset(out),down_smem,(NSUInteger)ar_slots6_nsg(),g_ar_down_carry,ar_down_split)) return 0;
                     }
                     if (!ds4_gpu_flush_commands()) return 0;
                     ar_resident_gate_done=stream_expert_resident_mask;
@@ -44100,7 +44273,8 @@ int ds4_gpu_routed_moe_one_tensor(
                               n_expert,
                               0)) &&
                      ds4_gpu_encode_mul_mv_slots6_pair_swiglu(cb,
-                                                              slots_pair_swiglu_pipeline,
+                                                              (slots_pair_swiglu_pipeline == g_moe_mul_mv_slots6_q4_k_pair_swiglu_pipeline && ar_slots6_nsg() != 2) ?
+                                                                  ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_slots6_q4_K_pair_swiglu_f32", (int16_t)ar_slots6_nsg()) : slots_pair_swiglu_pipeline,
                                                               &gate_args,
                                                               &act_args,
                                                               gate_slot_bufs,
@@ -44118,7 +44292,7 @@ int ds4_gpu_routed_moe_one_tensor(
                                                               weightsbuf,
                                                               ds4_gpu_tensor_offset(weights),
                                                               gate_smem,
-                                                              2,
+                                                              (slots_pair_swiglu_pipeline == g_moe_mul_mv_slots6_q4_k_pair_swiglu_pipeline) ? (NSUInteger)ar_slots6_nsg() : 2,
                                                               false,
                                                               ar_resident_gate_done ? stream_expert_missing_mask : 0u);
             }
@@ -44442,11 +44616,12 @@ int ds4_gpu_routed_moe_one_tensor(
                               0)) &&
                      (ar_down_split ?
                       ds4_gpu_encode_mul_mv_slots6_continuation(cb,
-                            ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_slots6_q4_K_resume_f32",2),
+                            ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_slots6_q4_K_resume_f32",(int16_t)ar_slots6_nsg()),
                             &down_args,down_slot_bufs,down_slot_offsets,midbuf,ds4_gpu_tensor_offset(mid),
-                            outbuf,ds4_gpu_tensor_offset(out),down_smem,2,g_ar_down_carry,ar_down_split) :
+                            outbuf,ds4_gpu_tensor_offset(out),down_smem,(NSUInteger)ar_slots6_nsg(),g_ar_down_carry,ar_down_split) :
                       ds4_gpu_encode_mul_mv_slots6_sum6(cb,
-                                                       slots_sum6_pipeline,
+                                                       (slots_sum6_pipeline == g_moe_mul_mv_slots6_q4_k_sum6_pipeline && ar_slots6_nsg() != 2) ?
+                                                           ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_slots6_q4_K_sum6_f32", (int16_t)ar_slots6_nsg()) : slots_sum6_pipeline,
                                                        &down_args,
                                                        down_slot_bufs,
                                                        down_slot_offsets,
@@ -44455,7 +44630,7 @@ int ds4_gpu_routed_moe_one_tensor(
                                                        outbuf,
                                                        ds4_gpu_tensor_offset(out),
                                                        down_smem,
-                                                       2));
+                                                       (slots_sum6_pipeline == g_moe_mul_mv_slots6_q4_k_sum6_pipeline) ? (NSUInteger)ar_slots6_nsg() : 2));
             }
         } else if (ok && direct_down_sum) {
             ok = ds4_gpu_encode_mul_mv_id_sum6(cb,
