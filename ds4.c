@@ -39100,6 +39100,8 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) 
     X(residual, DS4_N_HC * DS4_N_EMBD) \
     X(pre, DS4_N_HC) X(selected_comp, DS4_N_INDEXER_TOP_K) \
     X(selected, DS4_N_EXPERT_USED) \
+    X(selected_w1, DS4_N_EXPERT_USED) X(selected_w2, DS4_N_EXPERT_USED) \
+    X(selected_w3, DS4_N_EXPERT_USED) X(selected_w4, DS4_N_EXPERT_USED) \
     X(after_attn, DS4_N_HC * DS4_N_EMBD) X(ffn_split, 24) \
     X(attn_split, 24) X(qr, DS4_N_LORA_Q) \
     X(q, DS4_N_HEAD * DS4_N_HEAD_DIM) X(kv, DS4_N_HEAD_DIM) \
@@ -39185,6 +39187,8 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(heads, DS4_N_HEAD * DS4_N_HEAD_DIM) X(low, DS4_N_OUT_GROUP * DS4_N_LORA_O) \
     X(route_logits, DS4_N_EXPERT) X(route_probs, DS4_N_EXPERT) \
     X(selected, DS4_N_EXPERT_USED) X(route_weights, DS4_N_EXPERT_USED) \
+    X(selected_w1, DS4_N_EXPERT_USED) X(selected_w2, DS4_N_EXPERT_USED) \
+    X(selected_w3, DS4_N_EXPERT_USED) X(selected_w4, DS4_N_EXPERT_USED) \
     X(gate, DS4_N_EXPERT_USED * DS4_N_FF_EXP) \
     X(up, DS4_N_EXPERT_USED * DS4_N_FF_EXP) X(mid, DS4_N_EXPERT_USED * DS4_N_FF_EXP) \
     X(experts, DS4_N_EXPERT_USED * DS4_N_EMBD) X(routed, DS4_N_EMBD) \
@@ -40559,37 +40563,226 @@ static int ar_prefill_selective_for(uint32_t count) {
 /* Stage only the experts this chunk routed to. The router needs nothing but resident
  * weights, so running it before any expert byte is read costs one drain per layer and
  * halves the bytes: a 512-token chunk touches ~187 of 384 experts. */
+/* Argodrive 2026-09-30 diagnostic (DS4_ARGODRIVE_PREFILL_IDS_DUMP=path): append one
+ * line per staged layer, "il n_ids id:count ...", so a hotness prior for read-ahead
+ * staging can be scored offline. Off unless the variable names a writable file. */
+static FILE *ar_prefill_ids_dump(void) {
+    static int checked; static FILE *fp;
+    if (!checked) {
+        checked = 1;
+        const char *e = getenv("DS4_ARGODRIVE_PREFILL_IDS_DUMP");
+        if (e && *e) fp = fopen(e, "a");
+    }
+    return fp;
+}
+/* Argodrive 2026-09-30 (ARGODRIVE_PREFILL_HOT): DS4_ARGODRIVE_PREFILL_HOT=K reads the
+ * next layer's K likeliest experts into the spare staging set while this layer
+ * computes. The ranking comes from DS4_ARGODRIVE_HOTLIST, a text file of lines
+ * "layer n id:count ..." produced from prefill selection dumps of other prompts; the
+ * loader ranks each layer's experts by count. Nothing else changes: the ids the
+ * router selects are still all staged before the routed MoE runs. */
+static uint32_t ar_prefill_hot_k(void) {
+    static int checked; static uint32_t k;
+    if (!checked) {
+        checked = 1; const char *e = getenv("DS4_ARGODRIVE_PREFILL_HOT");
+        if (e && *e) { char *end = NULL; unsigned long n = strtoul(e, &end, 10); if (end != e && !*end && n <= 65536) k = (uint32_t)n; }
+        if (k) fprintf(stderr, "ds4: Argodrive prefill read-ahead of up to %u ranked experts per layer\n", k);
+    }
+    return k;
+}
+static int32_t *ar_hot_ids;   /* [n_layer][n_expert], ranked by descending count */
+static uint32_t *ar_hot_n;    /* ranked experts per layer */
+static uint32_t ar_hot_layers;
+static int ar_hot_cmp(const void *a, const void *b) {
+    const uint64_t *x = a, *y = b; /* (count << 32 | id): higher count first, then lower id */
+    if ((*x >> 32) != (*y >> 32)) return (*x >> 32) < (*y >> 32) ? 1 : -1;
+    return (uint32_t)*x < (uint32_t)*y ? -1 : (uint32_t)*x > (uint32_t)*y;
+}
+static int ar_hotlist_load(void) {
+    static int checked, ok;
+    if (checked) return ok;
+    checked = 1;
+    const char *path = getenv("DS4_ARGODRIVE_HOTLIST");
+    if (!path || !*path) return 0;
+    FILE *fp = fopen(path, "r");
+    if (!fp) { fprintf(stderr, "ds4: Argodrive hotlist %s: %s\n", path, strerror(errno)); return 0; }
+    const uint32_t n_layer = DS4_N_LAYER, n_expert = DS4_N_EXPERT;
+    ar_hot_ids = calloc((size_t)n_layer * n_expert, sizeof(int32_t));
+    ar_hot_n = calloc(n_layer, sizeof(uint32_t));
+    uint64_t *keys = calloc(n_expert, sizeof(uint64_t));
+    uint8_t *seen = calloc(n_expert, 1);
+    char *line = NULL; size_t cap = 0; ssize_t len;
+    uint32_t layers_seen = 0;
+    if (ar_hot_ids && ar_hot_n && keys && seen) {
+        while ((len = getline(&line, &cap, fp)) > 0) {
+            char *p = line; char *end = NULL;
+            unsigned long il = strtoul(p, &end, 10);
+            if (end == p || il >= n_layer) continue;
+            p = end;
+            (void)strtoul(p, &end, 10); /* count of pairs, informational */
+            if (end == p) continue;
+            p = end;
+            memset(seen, 0, n_expert);
+            uint32_t n = 0;
+            for (;;) {
+                while (*p == ' ' || *p == '\t') p++;
+                if (*p == '\n' || *p == '\0' || *p == '\r') break;
+                unsigned long id = strtoul(p, &end, 10);
+                if (end == p) break;
+                p = end;
+                unsigned long count = 1;
+                if (*p == ':') { p++; count = strtoul(p, &end, 10); if (end == p) break; p = end; }
+                if (id < n_expert && !seen[id]) { seen[id] = 1; keys[n++] = ((uint64_t)count << 32) | (uint32_t)id; }
+            }
+            if (!n) continue;
+            qsort(keys, n, sizeof(uint64_t), ar_hot_cmp);
+            for (uint32_t k = 0; k < n; k++) ar_hot_ids[il * n_expert + k] = (int32_t)(uint32_t)keys[k];
+            if (!ar_hot_n[il]) layers_seen++;
+            ar_hot_n[il] = n;
+        }
+        ok = layers_seen > 0;
+    }
+    free(line); free(keys); free(seen); fclose(fp);
+    ar_hot_layers = ok ? n_layer : 0;
+    fprintf(stderr, "ds4: Argodrive prefill hotlist %s: %u of %u layers ranked%s\n", path, layers_seen, n_layer, ok ? "" : " (disabled)");
+    return ok;
+}
+static void ar_prefill_prestage_next(const ds4_model *m, const ds4_layer_weights *next_l, uint32_t next_il) {
+    const uint32_t k = ar_prefill_hot_k();
+    if (!k || !next_l || !next_l->ffn_gate_exps || !next_l->ffn_up_exps || !next_l->ffn_down_exps) return;
+    if (!ar_hotlist_load() || next_il >= ar_hot_layers || !ar_hot_n[next_il]) return;
+    const uint64_t gate_row = routed_expert_row_bytes(next_l->ffn_gate_exps);
+    const uint64_t down_row = routed_expert_row_bytes(next_l->ffn_down_exps);
+    const uint64_t offsets[3] = { next_l->ffn_gate_exps->abs_offset, next_l->ffn_up_exps->abs_offset,
+                                  next_l->ffn_down_exps->abs_offset };
+    const uint64_t sizes[3] = { next_l->ffn_gate_exps->bytes, next_l->ffn_up_exps->bytes, next_l->ffn_down_exps->bytes };
+    uint32_t n = ar_hot_n[next_il]; if (n > k) n = k;
+    (void)ar_prefill_prestage_start(m->map, m->size, offsets, sizes, gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD,
+                                    &ar_hot_ids[(size_t)next_il * DS4_N_EXPERT], n);
+}
+/* Argodrive 2026-09-30 (ARGODRIVE_PREFILL_WAVES): DS4_ARGODRIVE_PREFILL_WAVES=1 runs the
+ * routed MoE in two waves when the read-ahead landed part of a layer: wave 1 covers the
+ * experts already on hand and is committed before the top-up reads, wave 2 the rest
+ * afterwards. Bit-exact by construction: the mm_id map skips ids that match no expert,
+ * every (token, slot) row is written exactly once by whichever wave owns it, and the
+ * fixed-order slot sum runs over the complete rows at the end. */
+static int ar_prefill_waves_enabled(void) {
+    /* Returns the number of top-up parts: 0 = off, 1 = one wave for the whole top-up,
+     * 2..3 = the top-up read in that many contiguous parts, each followed by its wave. */
+    static int checked, parts;
+    if (!checked) {
+        const char *e = getenv("DS4_ARGODRIVE_PREFILL_WAVES"); checked = 1;
+        if (e && *e && strcmp(e, "0") != 0) {
+            char *end = NULL; long v = strtol(e, &end, 10);
+            parts = (end != e && !*end) ? (int)(v < 1 ? 1 : (v > 3 ? 3 : v)) : 1;
+            fprintf(stderr, "ds4: Argodrive prefill routed MoE in waves: landed experts first, then %d top-up part%s\n",
+                    parts, parts == 1 ? "" : "s");
+        }
+    }
+    return parts;
+}
 static bool ds41_stage_selected_for_layer(ds41_gpu_graph *g, const ds4_model *m,
-                                          const ds4_layer_weights *l, uint32_t count) {
+                                          const ds4_layer_weights *l, uint32_t il, uint32_t count,
+                                          const ds4_layer_weights *next_l, int *waves_out) {
+    if (waves_out) *waves_out = 0;
     if (!ar_prefill_selective_for(count)) return true;
     if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) return false;
+    /* DS4_ARGODRIVE_PREFILL_TRACE=1: per-layer CPU timeline. since_publish = previous
+     * layer's publish to this drain start (encode + GPU + everything else), drain = wait
+     * for the router ids, stage = staging/top-up until publish. */
+    static int trace_checked, trace_on; static double trace_last_publish;
+    if (!trace_checked) { const char *e = getenv("DS4_ARGODRIVE_PREFILL_TRACE"); trace_on = e && strcmp(e, "0") != 0; trace_checked = 1; }
+    const double t_drain0 = trace_on ? now_sec() : 0;
     const int had_batch = ds4_gpu_commands_active() != 0;
     if (had_batch && !ds4_gpu_end_commands()) return false;
+    const double t_ids = trace_on ? now_sec() : 0;
     const int32_t *selected = ds4_gpu_tensor_contents(g->batch.selected);
     bool ok = selected != NULL;
     if (ok) {
         static uint8_t seen[DS4_MAX_EXPERT];
+        static uint32_t hits[DS4_MAX_EXPERT];
         static int32_t ids[DS4_MAX_EXPERT];
         memset(seen, 0, sizeof(seen));
+        memset(hits, 0, sizeof(hits));
         uint32_t n_ids = 0;
         for (uint32_t t = 0; ok && t < count; t++) {
             for (uint32_t j = 0; j < DS4_N_EXPERT_USED; j++) {
                 const int32_t id = selected[t * DS4_N_EXPERT_USED + j];
                 if (id < 0 || (uint32_t)id >= DS4_N_EXPERT) { ok = false; break; }
-                seen[id] = 1;
+                seen[id] = 1; hits[id]++;
             }
         }
         if (ok) {
             for (uint32_t i = 0; i < DS4_N_EXPERT; i++) if (seen[i]) ids[n_ids++] = (int32_t)i;
+            FILE *dump = ar_prefill_ids_dump();
+            if (dump) {
+                fprintf(dump, "%u %u", il, n_ids);
+                for (uint32_t i = 0; i < n_ids; i++) fprintf(dump, " %d:%u", ids[i], hits[ids[i]]);
+                fputc('\n', dump); fflush(dump);
+            }
             const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
             const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
             const uint64_t offsets[3] = { l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
                                           l->ffn_down_exps->abs_offset };
             const uint64_t sizes[3] = { l->ffn_gate_exps->bytes, l->ffn_up_exps->bytes,
                                         l->ffn_down_exps->bytes };
-            ok = n_ids > 0 && ar_prefill_stage_ids(m->map, m->size, offsets, sizes,
-                                                   gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD,
-                                                   ids, n_ids) != 0;
+            const int want_waves = waves_out != NULL && ar_prefill_waves_enabled();
+            if (want_waves) {
+                static uint8_t landed_k[DS4_MAX_EXPERT];
+                static uint8_t landed_by_id[DS4_MAX_EXPERT];
+                ok = n_ids > 0 && ar_prefill_stage_ids_begin(m->map, m->size, offsets, sizes,
+                                                             gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD,
+                                                             ids, n_ids, landed_k) != 0;
+                if (ok) {
+                    memset(landed_by_id, 0, sizeof(landed_by_id));
+                    uint32_t n_landed = 0;
+                    for (uint32_t k = 0; k < n_ids; k++) if (landed_k[k]) { landed_by_id[ids[k]] = 1; n_landed++; }
+                    int32_t *w[4] = { ds4_gpu_tensor_contents(g->batch.selected_w1), ds4_gpu_tensor_contents(g->batch.selected_w2),
+                                      ds4_gpu_tensor_contents(g->batch.selected_w3), ds4_gpu_tensor_contents(g->batch.selected_w4) };
+                    uint32_t parts = (uint32_t)want_waves;
+                    const uint32_t n_topup = n_ids - n_landed;
+                    if (parts > n_topup) parts = n_topup;
+                    if (n_landed == 0 || n_landed == n_ids || !w[0] || !w[1] || (parts > 1 && !w[2]) || (parts > 2 && !w[3])) {
+                        /* Nothing to split: finish the staging now, single routed pass. */
+                        ok = ar_prefill_stage_ids_finish() != 0;
+                        if (ok) ar_prefill_prestage_next(m, next_l, il + 1);
+                    } else {
+                        /* Top-up parts are contiguous ranges of the non-landed ids in ascending
+                         * order, the same split ar_prefill_stage_ids_finish_part uses. */
+                        static uint8_t part_by_id[DS4_MAX_EXPERT];
+                        uint32_t rank = 0;
+                        for (uint32_t k = 0; k < n_ids; k++) {
+                            if (landed_k[k]) continue;
+                            uint32_t p = 0;
+                            while (p + 1 < parts && rank >= (uint32_t)(((uint64_t)n_topup * (p + 1)) / parts)) p++;
+                            part_by_id[ids[k]] = (uint8_t)p;
+                            rank++;
+                        }
+                        for (uint32_t t = 0; t < count; t++) {
+                            for (uint32_t j = 0; j < DS4_N_EXPERT_USED; j++) {
+                                const uint32_t at = t * DS4_N_EXPERT_USED + j;
+                                const int32_t id = selected[at];
+                                const uint32_t owner = landed_by_id[id] ? 0u : 1u + part_by_id[id];
+                                for (uint32_t q = 0; q <= parts; q++) w[q][at] = (q == owner) ? id : -1;
+                            }
+                        }
+                        *waves_out = (int)parts; /* the caller: wave 1, flush, then per part: top-up part, wave */
+                    }
+                }
+            } else {
+                ok = n_ids > 0 && ar_prefill_stage_ids(m->map, m->size, offsets, sizes,
+                                                       gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD,
+                                                       ids, n_ids) != 0;
+                /* This layer is published; the drives are idle until the next router runs. */
+                if (ok) ar_prefill_prestage_next(m, next_l, il + 1);
+            }
+            if (trace_on) {
+                const double t_pub = now_sec();
+                fprintf(stderr, "ds4: Argodrive prefill trace layer=%u since_publish_ms=%.1f drain_ms=%.1f stage_ms=%.1f ids=%u\n",
+                        il, trace_last_publish ? (t_drain0 - trace_last_publish) * 1000 : 0.0,
+                        (t_ids - t_drain0) * 1000, (t_pub - t_ids) * 1000, n_ids);
+                trace_last_publish = t_pub;
+            }
         }
     }
     if (had_batch && !ds4_gpu_begin_commands()) return false;
@@ -40599,33 +40792,59 @@ static bool ds41_stage_selected_for_layer(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, uint32_t count,
-                           bool shared_owner) {
+                           bool shared_owner, const ds4_layer_weights *next_l) {
     ds41_prefill_row *b = &g->batch;
     const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
     bool mid_f16 = false;
-    return ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
-        ds41_route_batch(g, m, l, count) &&
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-        ds41_stage_selected_for_layer(g, m, l, count) &&
+#if !defined(__APPLE__) || defined(DS4_NO_GPU)
+    (void)next_l;
 #endif
-        ((shared_owner && g->tp_rank != (il & 1u)) ||
-        (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
-        ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
-        ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
-            count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
-        ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
-        ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true))) &&
-        ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
-            m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
-            l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
-            gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
-            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
-            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
-            il, count, &mid_f16, true) &&
-        (!shared_owner || g->tp_rank != (il & 1u) ||
-            ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD)) &&
-        ds41_sum_partial_batch(g, b->routed, il, count);
+    if (!(ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
+          ds41_route_batch(g, m, l, count))) return false;
+    int waves = 0;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (!ds41_stage_selected_for_layer(g, m, l, il, count, next_l, &waves)) return false;
+#endif
+    const bool skip_shared = shared_owner && g->tp_rank != (il & 1u);
+    if (!skip_shared &&
+        !(ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
+          ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
+          ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
+              count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
+          ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
+          ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true))) return false;
+#define DS41_ROUTED_BATCH(SEL) \
+        ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts, \
+            m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset, \
+            l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type, \
+            gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row, \
+            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, (SEL), b->route_weights, \
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm, \
+            il, count, &mid_f16, true)
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (waves) {
+        /* Wave 1: the experts the read-ahead already landed, committed so the GPU works
+         * while the drives read the rest. Then, per top-up part: read it, encode its wave,
+         * commit. Every (token, slot) row is written by exactly one wave; the last wave's
+         * fixed-order slot sum is the one that counts. */
+        const uint32_t parts = (uint32_t)waves;
+        const ds4_gpu_tensor *wsel[4] = { b->selected_w1, b->selected_w2, b->selected_w3, b->selected_w4 };
+        if (!DS41_ROUTED_BATCH(wsel[0])) return false;
+        if (!ds4_gpu_flush_commands()) return false;
+        for (uint32_t p = 0; p < parts; p++) {
+            if (!ar_prefill_stage_ids_finish_part(p, parts)) return false;
+            if (p + 1 == parts) ar_prefill_prestage_next(m, next_l, il + 1);
+            if (!DS41_ROUTED_BATCH(wsel[1 + p])) return false;
+            if (p + 1 < parts && !ds4_gpu_flush_commands()) return false;
+        }
+    } else
+#endif
+    if (!DS41_ROUTED_BATCH(b->selected)) return false;
+#undef DS41_ROUTED_BATCH
+    if (shared_owner && g->tp_rank == (il & 1u) &&
+        !ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD)) return false;
+    return ds41_sum_partial_batch(g, b->routed, il, count);
 }
 
 #include "argodrive_profile.h"
@@ -41223,6 +41442,12 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     }
     metal_graph_stream_prepare_slot prepare = {0};
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* Argodrive 2026-09-30: layer 0 has no previous layer to hide its staging behind, so
+     * its read-ahead starts here, in front of the embedding and layer-0 attention. */
+    if (ok && g->streaming && DS4_N_LAYER > 0 && ar_prefill_selective_for(total_count))
+        ar_prefill_prestage_next(m, &w->layer[0], 0);
+#endif
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (cancel && cancel(cancel_ud)) { ok = false; break; }
         if (encoder_only && il == 20u) {
@@ -41418,7 +41643,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 }
             }
             if (ok && batch_moe) {
-                ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false);
+                ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false,
+                                    (il + 1 < DS4_N_LAYER) ? &w->layer[il + 1] : NULL);
                 DS41_STAGE("shared/routed ffn");
                 if (ok && batch_hc) {
                     ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
@@ -41585,7 +41811,7 @@ static bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *toke
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds41_after_attention_batch(&active, model, l, rows) &&
-            ds41_moe_batch(g, model, l, il, rows, shared_owner) &&
+            ds41_moe_batch(g, model, l, il, rows, shared_owner, NULL) &&
             (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
                 (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
                 ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&

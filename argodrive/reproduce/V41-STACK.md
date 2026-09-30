@@ -1,5 +1,22 @@
 # V4.1 stack profile
 
+## 30 September candidate: `v41-stack-20260930` (prefill)
+
+`v41-stack-20260930` is `v41-stack-20260928` plus exactly:
+
+```sh
+DS4_ARGODRIVE_PREFILL_HOT=384
+DS4_ARGODRIVE_PREFILL_WAVES=1
+DS4_ARGODRIVE_HOTLIST=<repo>/argodrive/reproduce/hotlists/v41-flash-q4-readahead-20260930.txt
+```
+
+Prefill read-ahead staging and the two-wave routed MoE: the [30 September package](../candidates/2026-09-30-prefill/README.md)
+records 45.34 -> 67.96 prompt tokens/s at pp512 (+49.9%, three interleaved
+pairs against the 28 September tag build, both sides at a 3,600-expert cache) with byte-identical output and
+decode unchanged. Qualification at the 4,600-expert cache is pending; select the profile explicitly and
+pass the hotlist path for your checkout.
+
+
 ## 28 September update: `v41-stack-20260928`
 
 `v41-stack-20260928` is `v41-stack-20260927` plus exactly:

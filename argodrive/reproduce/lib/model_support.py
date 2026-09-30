@@ -21,6 +21,21 @@ DS41_LOCAL_BENCHMARK = {
 
 def ds41_fork_profile(model_path, replica_paths, profile='legacy'):
     """Export a reviewable configuration; this is not engine capability detection."""
+    if profile == 'v41-stack-20260930':
+        # 2026-09-30: the 28 September profile plus prefill read-ahead staging (the next layer's likeliest
+        # experts, ranked by a hotlist built from other prompts, are read while the GPU computes the current
+        # layer) and the two-wave routed MoE around the top-up. Output is bit-identical to the 28 September
+        # profile; decode is unchanged. Screens: argodrive/candidates/2026-09-30-prefill/README.md.
+        previous = ds41_fork_profile(model_path, replica_paths, 'v41-stack-20260928')
+        env = dict(previous['environment'])
+        hotlist = Path(__file__).resolve().parents[1] / 'hotlists' / 'v41-flash-q4-readahead-20260930.txt'
+        env.update({'DS4_ARGODRIVE_PREFILL_HOT': '384', 'DS4_ARGODRIVE_PREFILL_WAVES': '1',
+                    'DS4_ARGODRIVE_HOTLIST': str(hotlist)})
+        errors = list(previous['errors'])
+        if not hotlist.is_file(): errors.append(f'missing hotlist {hotlist}')
+        return {**previous, 'id': profile, 'status': 'Pinned V4.1 stack candidate (2026-09-30)', 'environment': env,
+                'errors': errors,
+                'scope': previous['scope'].replace('Opt-in three-drive V4.1 profile:', 'Opt-in three-drive V4.1 profile: prefill read-ahead and two-wave routed MoE,')}
     if profile == 'v41-stack-20260928':
         # 2026-09-28: the 27 September stack plus the post-MoE flush and the eviction pre-scan. Output is
         # bit-identical to the stack profile on the qualified prompts. Measured against the published

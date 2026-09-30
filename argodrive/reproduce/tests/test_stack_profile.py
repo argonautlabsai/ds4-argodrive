@@ -42,3 +42,25 @@ class Stack0928ProfileTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class Stack0930ProfileTests(unittest.TestCase):
+    def test_exports_previous_plus_exactly_the_prefill_switches(self):
+        old = ds41_fork_profile('/primary', ['/one', '/two'], 'v41-stack-20260928')
+        new = ds41_fork_profile('/primary', ['/one', '/two'], 'v41-stack-20260930')
+        added = {k: v for k, v in new['environment'].items() if old['environment'].get(k) != v}
+        self.assertEqual(set(added), {'DS4_ARGODRIVE_PREFILL_HOT', 'DS4_ARGODRIVE_PREFILL_WAVES', 'DS4_ARGODRIVE_HOTLIST'})
+        self.assertEqual(added['DS4_ARGODRIVE_PREFILL_HOT'], '384')
+        self.assertEqual(added['DS4_ARGODRIVE_PREFILL_WAVES'], '1')
+        self.assertTrue(added['DS4_ARGODRIVE_HOTLIST'].endswith('hotlists/v41-flash-q4-readahead-20260930.txt'))
+        self.assertEqual({k: v for k, v in old['environment'].items() if k not in added}, {k: v for k, v in new['environment'].items() if k not in added})
+        self.assertEqual(new['cache_experts'], old['cache_experts'])
+        self.assertEqual(new['errors'], [])
+
+    def test_hotlist_file_ranks_every_layer(self):
+        new = ds41_fork_profile('/primary', ['/one', '/two'], 'v41-stack-20260930')
+        lines = [l.split() for l in open(new['environment']['DS4_ARGODRIVE_HOTLIST']) if l.strip()]
+        self.assertEqual(sorted(int(l[0]) for l in lines), list(range(40)))
+        for l in lines:
+            self.assertEqual(int(l[1]), len(l) - 2)
+            self.assertGreaterEqual(int(l[1]), 300)
