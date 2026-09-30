@@ -19,12 +19,13 @@ for arm in data['arms']:
         assert float(row[field]) == arm[key], (arm['id'], field)
     assert int(row['prefill_tokens']) == arm['prompt_tokens'] == 512 and int(row['gen_tokens']) == arm['generated_tokens']
     assert arm['prompt_sha256'] == prompt_sha and arm['output_sha256'] == expected[arm['generated_tokens']], arm['id']
-    assert arm['requested_cache_experts'] == 3600 and arm['runtime_cache']['matches_requested'] and not arm['runtime_cache']['allocation_reduced']
+    want = 4200 if arm['group'] in ('qual512', 'qual200') else 3600
+    assert arm['requested_cache_experts'] == want and arm['runtime_cache']['matches_requested'] and not arm['runtime_cache']['allocation_reduced'], arm['id']
     assert arm['swap_growth_mb'] == 0 and arm['gpu_active_mhz'] >= 1600, arm['id']
     if arm['label'] == 'B' or arm['group'] == 'topup-parts':
         d = arm['environment_delta']
         assert d.get('DS4_ARGODRIVE_PREFILL_HOT') == '384' and d.get('DS4_ARGODRIVE_HOTLIST') == data['hotlist']['path'], arm['id']
-for gid in ('readahead', 'readahead-layer0', 'two-wave', 'final'):
+for gid in ('readahead', 'readahead-layer0', 'two-wave', 'final', 'qual512', 'qual200'):
     g = groups[gid]; arms = [a for a in data['arms'] if a['group'] == gid]
     a = [x for x in arms if x['label'] == 'A']; b = [x for x in arms if x['label'] == 'B']
     assert len(a) == len(b) >= 2 and g['complete'], gid
@@ -35,6 +36,8 @@ for gid in ('readahead', 'readahead-layer0', 'two-wave', 'final'):
     assert abs(g['prefill_gain_pct'] - 100 * (g['medians']['B']['prefill_tok_s'] / g['medians']['A']['prefill_tok_s'] - 1)) < 1e-9
     assert abs(g['steady_gain_pct']) < 2.0, (gid, 'decode should be unchanged')
 final = groups['final']; assert len(final['arms']) == 6
-print(f"verified {len(data['arms'])} arms in {len(data['groups'])} groups; final screen prefill "
-      f"{final['medians']['A']['prefill_tok_s']:.2f} -> {final['medians']['B']['prefill_tok_s']:.2f} tok/s "
-      f"({final['prefill_gain_pct']:+.1f}%), decode {final['steady_gain_pct']:+.2f}%; every arm's output matches the published reference hash")
+q5, q2 = groups['qual512'], groups['qual200']; assert len(q5['arms']) == len(q2['arms']) == 4
+print(f"verified {len(data['arms'])} arms in {len(data['groups'])} groups; qualification prefill "
+      f"{q5['medians']['A']['prefill_tok_s']:.2f} -> {q5['medians']['B']['prefill_tok_s']:.2f} tok/s at 512/512 ({q5['prefill_gain_pct']:+.1f}%) and "
+      f"{q2['medians']['A']['prefill_tok_s']:.2f} -> {q2['medians']['B']['prefill_tok_s']:.2f} at 512/200 ({q2['prefill_gain_pct']:+.1f}%), "
+      f"decode {q5['steady_gain_pct']:+.2f}% / {q2['steady_gain_pct']:+.2f}%; every arm's output matches the published reference hash")

@@ -1,24 +1,30 @@
-# Prefill read-ahead and two-wave routed MoE — screens, September 30
+# Prefill read-ahead and two-wave routed MoE — qualification, September 30
 
-**67.96 prompt tokens/s at pp512** against **45.34** for the published
-`v41-stack-20260928` binary in the same session (**+49.9%**, three interleaved pairs),
-with **byte-identical output on every arm** and decode unchanged (20.03 / 20.25
-steady tok/s, +1.10%). M5 Max, 128 GiB, internal SSD and two Thunderbolt 5 NVMe enclosures.
+**68.59 prompt tokens/s at pp512/tg512** against **45.55** for the published
+`v41-stack-20260928` binary in the same session (**+50.6%**, BAAB), and **68.09** against
+**45.50** at pp512/tg200 (**+49.6%**, ABBA), with **byte-identical output on every arm** and
+decode unchanged (21.08 / 20.93 steady tok/s at 512/512, -0.71%; 20.88 / 20.76
+at 512/200, -0.60%). M5 Max, 128 GiB, internal SSD and two Thunderbolt 5 NVMe enclosures.
+Release: `v41-stack-20260930`.
 
-**These are screens, not the qualification.** Both sides ran with a 3,600-expert cache: the champion's
-4,600-expert cache tripped the swap-growth guard on a machine with fifteen days of uptime and 4.6 GB of
-swap in use. Decode rates on both sides are therefore below the published champion (23.26 at 512/512).
-The 4,600 qualification (512/512 BAAB and 512/200 ABBA, probe-gated) runs after a reboot; until then the
-profile `v41-stack-20260930` is a candidate.
+**Cache caveat.** The qualification ran with a 4,200-expert cache on both sides and the earlier screens with 3,600:
+the champion's 4,600-expert cache tripped the swap-growth guard on a machine with fifteen days of uptime and 5 GB of
+swap in use, and this campaign was run without a reboot at KP's request. The profile still requests 4,600 experts;
+decode rates in this session are therefore below the published champion (23.26 at 512/512) on both sides, and every
+comparison here is paired within its group. Prefill does not depend on the cache size beyond a percent or two.
 
 | Group | Order | Control prefill | Candidate prefill | Gain | Steady decode A / B | Pair deltas |
 |---|---|---:|---:|---:|---|---|
-| Read-ahead staging (build 1) | ABAB | 46.27 | **65.44** | **+41.5%** | 19.71 / 19.66 (-0.23%) | +18.88, +19.48 |
-| + layer-0 read-ahead (build 2) | ABAB | 46.67 | **65.62** | **+40.6%** | 19.97 / 19.77 (-1.00%) | +19.08, +18.81 |
-| + two-wave routed MoE (build 3) | ABAB | 46.63 | **66.34** | **+42.3%** | 19.98 / 19.94 (-0.23%) | +17.23, +22.20 |
-| Final binary, three pairs | ABABAB | 45.34 | **67.96** | **+49.9%** | 20.03 / 20.25 (+1.10%) | +22.40, +22.57, +22.77 |
+| Qualification 512/512, cache 4,200 | BAAB | 45.55 | **68.59** | **+50.6%** | 21.08 / 20.93 (-0.71%) | +23.01, +23.05 |
+| Qualification 512/200, cache 4,200 | ABBA | 45.50 | **68.09** | **+49.6%** | 20.88 / 20.76 (-0.60%) | +21.93, +23.24 |
+| Group | Order | Control prefill | Candidate prefill | Gain | Steady decode A / B | Pair deltas |
+|---|---|---:|---:|---:|---|---|
+| Screen: read-ahead staging (build 1), cache 3,600 | ABAB | 46.27 | **65.44** | **+41.5%** | 19.71 / 19.66 (-0.23%) | +18.88, +19.48 |
+| Screen: + layer-0 read-ahead (build 2), cache 3,600 | ABAB | 46.67 | **65.62** | **+40.6%** | 19.97 / 19.77 (-1.00%) | +19.08, +18.81 |
+| Screen: + two-wave routed MoE (build 3), cache 3,600 | ABAB | 46.63 | **66.34** | **+42.3%** | 19.98 / 19.94 (-0.23%) | +17.23, +22.20 |
+| Screen: final binary, three pairs, cache 3,600 | ABABAB | 45.34 | **67.96** | **+49.9%** | 20.03 / 20.25 (+1.10%) | +22.40, +22.57, +22.77 |
 
-Final-screen arms in order: control 46.68, 45.34, 45.19; candidate 69.08, 67.91, 67.96 tok/s.
+Final-screen arms in order (cache 3,600): control 46.68, 45.34, 45.19; candidate 69.08, 67.91, 67.96 tok/s.
 The single-lever check `topup-parts` (top-up read in two parts, `DS4_ARGODRIVE_PREFILL_WAVES=2`) measured
 68.87 against 69.19 for one part
 (-0.5%) and is not part of the profile.
@@ -56,7 +62,7 @@ had zero swap growth and held 1,620 MHz active GPU clocks; all outputs match the
 startup. A fresh process still pays about 0.2 s of first-layer cost that the trace attributes to first use of
 the freshly allocated staging buffers; it is inside every number here.
 
-Not measured here: the 4,600-expert cache, 512-token generation, other prompt lengths (the read-ahead only
+Not measured here: the 4,600-expert cache, other prompt lengths (the read-ahead only
 applies to the selective path, prompts of at most 512 tokens per chunk), or upstream ds4. The prior is
 domain-sensitive: a 37-prompt list with English technical prose covered fewer of this prompt's selections
 than the 19-prompt list and is not shipped.

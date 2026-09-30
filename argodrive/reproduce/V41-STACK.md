@@ -11,10 +11,10 @@ DS4_ARGODRIVE_HOTLIST=<repo>/argodrive/reproduce/hotlists/v41-flash-q4-readahead
 ```
 
 Prefill read-ahead staging and the two-wave routed MoE: the [30 September package](../candidates/2026-09-30-prefill/README.md)
-records 45.34 -> 67.96 prompt tokens/s at pp512 (+49.9%, three interleaved
-pairs against the 28 September tag build, both sides at a 3,600-expert cache) with byte-identical output and
-decode unchanged. Qualification at the 4,600-expert cache is pending; select the profile explicitly and
-pass the hotlist path for your checkout.
+records 45.55 -> 68.59 prompt tokens/s at pp512/tg512 (+50.6%, BAAB) and
+45.50 -> 68.09 at pp512/tg200 (+49.6%, ABBA) against the 28 September tag build,
+both sides at a 4,200-expert cache (the 4,600 cache tripped the swap guard on the un-rebooted machine), with
+byte-identical output and decode unchanged. Select the profile explicitly and pass the hotlist path for your checkout.
 
 
 ## 28 September update: `v41-stack-20260928`

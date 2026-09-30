@@ -14,6 +14,8 @@ A small step on top of the 27 September stack, which carried the large move (+12
 
 [**Qualified results release**](https://github.com/argonautlabsai/ds4-argodrive/releases/tag/v41-stack-20260928) · [**Results, all 35 CSVs and the rejected levers**](argodrive/candidates/2026-09-28-flush/README.md) · [**Reproduce the result**](argodrive/reproduce/V41-STACK.md#run) · [**Machine-readable evidence**](argodrive/candidates/2026-09-28-flush/results.json)
 
+**Prefill, 30 September: 68.59 prompt tokens/s at pp512/tg512 against 45.55 for the 28 September binary in the same session (+50.6%), 68.09 against 45.50 at pp512/tg200 (+49.6%).** Output byte-identical on every arm, decode unchanged (-0.71% / -0.60%). Profile `v41-stack-20260930` adds read-ahead staging (the next layer's likeliest experts are read while the GPU computes the current one, ranked by a [hotlist built from other prompts](argodrive/reproduce/hotlists/README.md)) and a two-wave routed MoE around the remaining reads. Qualified at a 4,200-expert cache on both sides because the 4,600 champion cache tripped the swap-growth guard on the un-rebooted machine; the decode headline above stands from the 28 September package. [**Release**](https://github.com/argonautlabsai/ds4-argodrive/releases/tag/v41-stack-20260930) · [**Results, all 30 CSVs and the rejected variant**](argodrive/candidates/2026-09-30-prefill/README.md) · [**Drive ladder with this profile**](argodrive/candidates/2026-09-30-ladder/README.md)
+
 **Against pinned upstream ds4 on one, two and three drives** (27 September, one interleaved session, 512-token prompt, 200 generated; upstream median of 6 arms, fork rungs median of two):
 
 | | prompt processing tok/s | steady decode tok/s | incl. first step tok/s |
@@ -30,11 +32,27 @@ A small step on top of the 27 September stack, which carried the large move (+12
 
 The internal-only row is software only: the same laptop, the same single SSD and the same model file as the upstream control, with no replicas. Output is byte-identical to upstream on all 12 arms. Every arm ran as a fresh process with an empty expert cache; fork arms held 1,620 MHz GPU clocks and zero swap growth. The fork rungs use profile `v41-stack-20260927` with 4,600 cached experts; upstream sizes its cache automatically (3,688). This is the pinned upstream base of this fork, not current upstream ds4. [Ladder results, all 12 CSVs and the verifier](argodrive/candidates/2026-09-27-ladder/README.md) · [machine-readable](argodrive/candidates/2026-09-27-ladder/results.json).
 
-Profile `v41-stack-20260928` is `v41-stack-20260927` plus exactly `DS4_ARGODRIVE_POST_MOE_FLUSH=1` and `DS4_ARGODRIVE_VICTIM_PRESCAN=1`; the earlier profiles remain selectable. Profile `v41-stack-20260927` is the published router profile plus three opt-in engine paths and a 4,600-expert cache (was 4,200). **Flag readback** (+6.6% alone): a mailbox kernel publishes the router's expert ids from inside the running command buffer; the CPU polls it and starts the miss reads while the shared-expert work, encoded before the commit, keeps the GPU busy. **Larger cache** (+3.0 to +3.3% alone): steady misses per token fall from 13.1 to 11.1 at 512 tokens. **Fused BF16 epilogues** (+0.5%) and a **pipeline-state cache** (+0.8%), plus an environment-lookup cache that is now the code default (+0.5%). Each lever was screened with interleaved pairs before the stack was qualified as a whole. Cache sizes above 4,600 tripped the swap guard; memory keep-alives, read-pool spinning, completion polling, Q8 row tiling and pipeline pre-warming were screened and rejected. Engine defaults are unchanged and the earlier profiles still run.
+**The same ladder with the 30 September prefill profile** (one interleaved session, 512-token prompt, 200 generated; upstream median of 6, fork rungs median of 2; fork rungs at a 3,600-expert cache, see [conditions](argodrive/candidates/2026-09-30-ladder/README.md)):
+
+| | prompt processing tok/s | steady decode tok/s | incl. first step tok/s |
+|---|---:|---:|---:|
+| upstream ds4 `bd66c40`, internal SSD only, automatic cache | 16.12 | 10.11 | 9.73 |
+| this fork, internal SSD only, no replicas | **43.75** (2.71×) | 16.77 (1.66×) | 16.15 (1.66×) |
+| this fork, + one enclosure (10:5 prefill, 10:6 decode) | 58.13 (3.61×) | 18.67 (1.85×) | 17.89 (1.84×) |
+| this fork, + two enclosures (10:5:5 prefill, 10:6:6 decode) | **68.29** (4.24×) | 20.02 (1.98×) | 19.22 (1.98×) |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="argodrive/charts/ladder-prefill-20260930-dark.svg">
+  <img src="argodrive/charts/ladder-prefill-20260930.svg" alt="Prompt processing and steady decode, pinned upstream vs this fork with the prefill profile on one, two and three drives, 30 September 2026">
+</picture>
+
+Prompt processing is the new result; the decode rungs are below the 27 September ladder because of the smaller cache and the machine's state that day, and the 27 September ladder stays the decode reference. Output was identical on all 12 arms.
+
+Profile `v41-stack-20260930` is `v41-stack-20260928` plus exactly `DS4_ARGODRIVE_PREFILL_HOT=384`, `DS4_ARGODRIVE_PREFILL_WAVES=1` and `DS4_ARGODRIVE_HOTLIST=<repo>/argodrive/reproduce/hotlists/v41-flash-q4-readahead-20260930.txt`. Profile `v41-stack-20260928` is `v41-stack-20260927` plus exactly `DS4_ARGODRIVE_POST_MOE_FLUSH=1` and `DS4_ARGODRIVE_VICTIM_PRESCAN=1`; the earlier profiles remain selectable. Profile `v41-stack-20260927` is the published router profile plus three opt-in engine paths and a 4,600-expert cache (was 4,200). **Flag readback** (+6.6% alone): a mailbox kernel publishes the router's expert ids from inside the running command buffer; the CPU polls it and starts the miss reads while the shared-expert work, encoded before the commit, keeps the GPU busy. **Larger cache** (+3.0 to +3.3% alone): steady misses per token fall from 13.1 to 11.1 at 512 tokens. **Fused BF16 epilogues** (+0.5%) and a **pipeline-state cache** (+0.8%), plus an environment-lookup cache that is now the code default (+0.5%). Each lever was screened with interleaved pairs before the stack was qualified as a whole. Cache sizes above 4,600 tripped the swap guard; memory keep-alives, read-pool spinning, completion polling, Q8 row tiling and pipeline pre-warming were screened and rejected. Engine defaults are unchanged and the earlier profiles still run.
 
 This fork builds on [ds4 by Salvatore Sanfilippo (antirez) and contributors](https://github.com/antirez/ds4). The reader, scheduling changes and Metal kernels are included in this repository; no private provider is required. Original licences, acknowledgements and [credits](CREDITS.md) are preserved. Development and review used Claude, ChatGPT and OpenAI Codex.
 
-Build release tag `v41-stack-20260928` and select profile `v41-stack-20260928`. Prefill reads split **10:5:5**, decode **10:6:6**; Engram stays asynchronous on the primary SSD. Keepalive consumes additional power and can lose performance under competing GPU work.
+Build release tag `v41-stack-20260930` and select profile `v41-stack-20260930` (or `v41-stack-20260928` for the decode-only stack). Prefill reads split **10:5:5**, decode **10:6:6**; Engram stays asynchronous on the primary SSD. Keepalive consumes additional power and can lose performance under competing GPU work.
 
 ## Build and test
 

@@ -1,7 +1,7 @@
 {
   "id": "v41-stack-20260930",
   "status": "Pinned V4.1 stack candidate (2026-09-30)",
-  "engine_commit": "ec1123046523f14fc0d2340a3cd24e450290c495",
+  "engine_commit": "9fb9c8f9c075ad5bf245f346412b5cfdfbd9893b",
   "compiler": "Apple clang 14.0.3 (clang-1403.0.22.14.1)",
   "sdk": "macOS 26.4",
   "environment": {
