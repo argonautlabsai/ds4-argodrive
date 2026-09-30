@@ -269,8 +269,15 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
             .out = out + start * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM, .readers = 1};
         /* Fixed concurrency hides random-read latency without caching the table.
          * Each worker owns disjoint output rows; all finish before GPU use. */
-        if (count >= 256) {
+        static long engram_par_min = -1;
+        if (engram_par_min < 0) {
+            const char *e = getenv("DS4_ENGRAM_PARALLEL_MIN");
+            engram_par_min = (e && e[0]) ? strtol(e, NULL, 10) : 256;
+            if (engram_par_min < 2) engram_par_min = 2;
+        }
+        if (count >= (size_t)engram_par_min) {
             batch.readers = ENGRAM_READERS;
+            if (batch.readers > count) batch.readers = count;
 #ifdef __APPLE__
             dispatch_apply_f(batch.readers,
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &batch, read_batch_part);

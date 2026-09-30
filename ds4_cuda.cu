@@ -18,6 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <atomic>
 #include "ds4_linux_memory.h"
 #include <unordered_map>
@@ -2171,7 +2172,9 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
     return 1;
 }
 
-static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
+static thread_local int t_in_expert_read;
+
+static int cuda_pread_range(int fd, void *buf, uint64_t bytes, uint64_t offset) {
     uint64_t done = 0;
     while (done < bytes) {
         const size_t n_req = (bytes - done > (uint64_t)SSIZE_MAX) ? (size_t)SSIZE_MAX : (size_t)(bytes - done);
@@ -2184,6 +2187,213 @@ static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
         done += (uint64_t)n;
     }
     return 1;
+}
+
+
+/* --- Parallel model read (queue-depth K, persistent reader pool) --------
+ * The streaming decode reads each expert tensor with a single synchronous
+ * pread (queue depth 1), which a striped RAID0 array serves at only ~half
+ * its peak bandwidth. Split large reads into disjoint sub-ranges read
+ * concurrently by a persistent pool of worker threads (queue depth K) so
+ * the block layer stays busy and the array reaches full bandwidth.
+ *
+ *   DS4_CUDA_READ_THREADS      K, max concurrent sub-reads (default 1 =
+ *                              original serial path, byte identical).
+ *   DS4_CUDA_READ_MIN_SPLIT_KB reads smaller than this stay serial
+ *                              (default 4096).
+ *   DS4_CUDA_READ_MIN_SUB_KB   floor on sub-read size, so a read splits
+ *                              into at most bytes/min_sub pieces
+ *                              (default 2048) -- avoids tiny sub-reads.
+ * Split points are rounded to g_model_direct_align, so each sub-read stays
+ * O_DIRECT aligned; disjoint file ranges fill disjoint buffer regions, so
+ * the bytes read match the serial path exactly. */
+static int g_cuda_read_threads = -1;
+static int cuda_read_threads(void) {
+    int k = g_cuda_read_threads;
+    if (k < 0) {
+        const char *e = getenv("DS4_CUDA_READ_THREADS");
+        k = (e && e[0]) ? atoi(e) : 1;
+        if (k < 1) k = 1;
+        if (k > 16) k = 16;
+        g_cuda_read_threads = k;
+    }
+    return k;
+}
+static uint64_t cuda_read_min_split(void) {
+    static uint64_t v = 0;
+    if (v == 0) {
+        const char *e = getenv("DS4_CUDA_READ_MIN_SPLIT_KB");
+        uint64_t kb = (e && e[0]) ? strtoull(e, NULL, 10) : 4096;
+        if (kb < 16) kb = 16;
+        v = kb * 1024ull;
+    }
+    return v;
+}
+static uint64_t cuda_read_min_sub(void) {
+    static uint64_t v = 0;
+    if (v == 0) {
+        const char *e = getenv("DS4_CUDA_READ_MIN_SUB_KB");
+        uint64_t kb = (e && e[0]) ? strtoull(e, NULL, 10) : 2048;
+        if (kb < 256) kb = 256;
+        v = kb * 1024ull;
+    }
+    return v;
+}
+
+struct cuda_pread_job {
+    int fd;
+    char *buf;
+    uint64_t off;
+    uint64_t len;
+    int ok;
+};
+
+struct cuda_reader_worker {
+    pthread_t th;
+    sem_t start;
+    sem_t done;
+    cuda_pread_job job;
+    int stop;
+};
+static cuda_reader_worker g_readers[16];
+static int g_readers_started = 0;
+static pthread_mutex_t g_readers_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void *cuda_reader_worker_main(void *arg) {
+    cuda_reader_worker *w = (cuda_reader_worker *)arg;
+    for (;;) {
+        sem_wait(&w->start);
+        if (w->stop) break;
+        w->job.ok = cuda_pread_range(w->job.fd, w->job.buf, w->job.len, w->job.off);
+        sem_post(&w->done);
+    }
+    return NULL;
+}
+
+static int cuda_readers_ensure(int want) {
+    if (want <= g_readers_started) return 1;
+    pthread_mutex_lock(&g_readers_lock);
+    while (g_readers_started < want && g_readers_started < 16) {
+        int i = g_readers_started;
+        g_readers[i].stop = 0;
+        if (sem_init(&g_readers[i].start, 0, 0) != 0) break;
+        if (sem_init(&g_readers[i].done, 0, 0) != 0) {
+            sem_destroy(&g_readers[i].start);
+            break;
+        }
+        if (pthread_create(&g_readers[i].th, NULL, cuda_reader_worker_main, &g_readers[i]) != 0) {
+            sem_destroy(&g_readers[i].start);
+            sem_destroy(&g_readers[i].done);
+            break;
+        }
+        g_readers_started++;
+    }
+    pthread_mutex_unlock(&g_readers_lock);
+    return g_readers_started >= want;
+}
+
+/* Debug accounting: wall time spent INSIDE reads vs bytes moved. Comparing the
+ * accumulated read time against elapsed wall time separates "reads are slow"
+ * from "reads are fast but the device sits idle between them". */
+static void cuda_pread_account(const struct timespec *t0, uint64_t bytes) {
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    const double dt = (t1.tv_sec - t0->tv_sec) + (t1.tv_nsec - t0->tv_nsec) / 1e9;
+    static std::atomic<uint64_t> n{0}, tot_ns{0}, tot_bytes{0};
+    static double wall0 = 0;
+    if (wall0 == 0) wall0 = t1.tv_sec + t1.tv_nsec / 1e9;
+    const uint64_t c = n.fetch_add(1) + 1;
+    tot_ns.fetch_add((uint64_t)(dt * 1e9));
+    tot_bytes.fetch_add(bytes);
+    if (c % 20000 == 0) {
+        const double in_read = tot_ns.load() / 1e9;
+        const double wall = (t1.tv_sec + t1.tv_nsec / 1e9) - wall0;
+        const double gb = tot_bytes.load() / 1073741824.0;
+        fprintf(stderr,
+            "[DS4 readprof] calls=%llu in_read=%.2fs wall=%.2fs duty=%.0f%% "
+            "inst=%.1f GiB/s avg=%.1f GiB/s\n",
+            (unsigned long long)c, in_read, wall,
+            wall > 0 ? 100.0 * in_read / wall : 0.0,
+            in_read > 0 ? gb / in_read : 0.0,
+            wall > 0 ? gb / wall : 0.0);
+    }
+}
+
+static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
+    const int K = cuda_read_threads();
+    const uint64_t MIN_SPLIT = cuda_read_min_split();
+    static int dbg = -1;
+    if (dbg < 0) dbg = getenv("DS4_PREAD_DEBUG") ? 1 : 0;
+    struct timespec _t0;
+    if (dbg) clock_gettime(CLOCK_MONOTONIC, &_t0);
+    if (dbg) {
+        static std::atomic<uint64_t> dc{0}, db{0}, dmin{~0ull}, dmax{0};
+        uint64_t c = dc.fetch_add(1) + 1;
+        db.fetch_add(bytes);
+        uint64_t om = dmin.load(); while (bytes < om && !dmin.compare_exchange_weak(om, bytes)) {}
+        uint64_t oM = dmax.load(); while (bytes > oM && !dmax.compare_exchange_weak(oM, bytes)) {}
+        if (c % 20000 == 0)
+            fprintf(stderr, "[DS4 pread] calls=%llu K=%d min=%lluK max=%lluK avg=%lluK workers=%d\n",
+                (unsigned long long)c, K,
+                (unsigned long long)(dmin.load()/1024), (unsigned long long)(dmax.load()/1024),
+                (unsigned long long)(db.load()/c/1024), g_readers_started);
+    }
+    if (K <= 1 || bytes < MIN_SPLIT || t_in_expert_read) {
+        const int r = cuda_pread_range(fd, buf, bytes, offset);
+        if (dbg) cuda_pread_account(&_t0, bytes);
+        return r;
+    }
+
+    const uint64_t align = g_model_direct_align > 1 ? g_model_direct_align : 4096;
+    const uint64_t min_sub = cuda_read_min_sub();
+    int n = (int)(bytes / min_sub);
+    if (n < 1) n = 1;
+    if (n > K) n = K;
+    if (n <= 1) {
+        return cuda_pread_range(fd, buf, bytes, offset);
+    }
+
+    uint64_t part = bytes / (uint64_t)n;
+    part = ((part + align - 1) / align) * align;
+    if (part == 0) part = align;
+
+    cuda_pread_job jobs[16];
+    int m = 0;
+    uint64_t pos = 0;
+    while (pos < bytes && m < n) {
+        uint64_t len = (m == n - 1) ? (bytes - pos)
+                                    : (part < bytes - pos ? part : bytes - pos);
+        jobs[m].fd = fd;
+        jobs[m].buf = (char *)buf + pos;
+        jobs[m].off = offset + pos;
+        jobs[m].len = len;
+        jobs[m].ok = 0;
+        pos += len;
+        m++;
+    }
+    if (pos < bytes) jobs[m - 1].len += bytes - pos;
+
+    if (m <= 1 || !cuda_readers_ensure(m - 1)) {
+        int ok = 1;
+        for (int i = 0; i < m; i++)
+            ok = cuda_pread_range(jobs[i].fd, jobs[i].buf, jobs[i].len, jobs[i].off) && ok;
+        return ok;
+    }
+
+    pthread_mutex_lock(&g_readers_lock);
+    for (int i = 1; i < m; i++) {
+        g_readers[i - 1].job = jobs[i];
+        sem_post(&g_readers[i - 1].start);
+    }
+    jobs[0].ok = cuda_pread_range(jobs[0].fd, jobs[0].buf, jobs[0].len, jobs[0].off);
+    int ok = jobs[0].ok;
+    for (int i = 1; i < m; i++) {
+        sem_wait(&g_readers[i - 1].done);
+        ok = ok && g_readers[i - 1].job.ok;
+    }
+    pthread_mutex_unlock(&g_readers_lock);
+    if (dbg) cuda_pread_account(&_t0, bytes);
+    return ok;
 }
 
 static int cuda_model_stage_read_from(int fd, int *direct_fd, uint64_t align,
@@ -2285,6 +2495,185 @@ static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
         }
     }
     g_stream_selected_stage_bytes = bytes;
+    return 1;
+}
+
+
+/* --- Parallel expert-tensor read ---------------------------------------
+ * An expert is three tensors (gate, up, down) at three unrelated file
+ * offsets, read strictly in sequence by the streaming loop. md RAID0
+ * already stripes any single read across every member drive, so splitting
+ * one read finer adds nothing (measured: identical throughput at 4 and 16
+ * way splits). What raises throughput is several INDEPENDENT request
+ * streams in flight -- which is what fio does to reach 30.9 GiB/s where a
+ * single stream tops out near 21. These three tensors are exactly that.
+ *
+ *   DS4_CUDA_PARALLEL_EXPERT_READ=1   enable (default off = unchanged)
+ *
+ * Each tensor lands in its own staging buffer, so the three reads touch
+ * disjoint memory and disjoint file ranges; uploads are then issued from
+ * the calling thread in gate/up/down order on the existing upload stream,
+ * preserving the ordering and event bookkeeping of the serial path. */
+static int cuda_parallel_expert_read_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_CUDA_PARALLEL_EXPERT_READ");
+        v = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return v;
+}
+
+struct cuda_tensor_read_job {
+    void *stage;
+    uint64_t stage_bytes;
+    uint64_t offset;
+    uint64_t bytes;
+    const char *payload;
+    int ok;
+};
+
+struct cuda_tensor_reader {
+    pthread_t th;
+    sem_t start;
+    sem_t done;
+    cuda_tensor_read_job *job;
+    int stop;
+};
+static cuda_tensor_reader g_tensor_readers[2];
+static int g_tensor_readers_started = 0;
+static pthread_mutex_t g_tensor_readers_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void *cuda_tensor_reader_main(void *arg) {
+    cuda_tensor_reader *w = (cuda_tensor_reader *)arg;
+    /* Inner splitting is pointless here (md already stripes) and would
+     * contend on the sub-read pool's lock, so suppress it on this thread. */
+    t_in_expert_read = 1;
+    for (;;) {
+        sem_wait(&w->start);
+        if (w->stop) break;
+        cuda_tensor_read_job *j = w->job;
+        j->ok = cuda_model_stage_read(j->stage, j->stage_bytes, j->offset,
+                                      j->bytes, &j->payload);
+        sem_post(&w->done);
+    }
+    return NULL;
+}
+
+static int cuda_tensor_readers_ensure(void) {
+    if (g_tensor_readers_started >= 2) return 1;
+    pthread_mutex_lock(&g_tensor_readers_lock);
+    while (g_tensor_readers_started < 2) {
+        int i = g_tensor_readers_started;
+        g_tensor_readers[i].stop = 0;
+        g_tensor_readers[i].job = NULL;
+        if (sem_init(&g_tensor_readers[i].start, 0, 0) != 0) break;
+        if (sem_init(&g_tensor_readers[i].done, 0, 0) != 0) {
+            sem_destroy(&g_tensor_readers[i].start);
+            break;
+        }
+        if (pthread_create(&g_tensor_readers[i].th, NULL,
+                           cuda_tensor_reader_main, &g_tensor_readers[i]) != 0) {
+            sem_destroy(&g_tensor_readers[i].start);
+            sem_destroy(&g_tensor_readers[i].done);
+            break;
+        }
+        g_tensor_readers_started++;
+    }
+    pthread_mutex_unlock(&g_tensor_readers_lock);
+    return g_tensor_readers_started >= 2;
+}
+
+/* Returns 1 on success, 0 on failure, -1 when not applicable (caller should
+ * fall back to three sequential cuda_model_copy_to_device_streamed calls). */
+static int cuda_model_copy_expert_parallel(
+        char *dst_g, uint64_t off_g, uint64_t n_g,
+        char *dst_u, uint64_t off_u, uint64_t n_u,
+        char *dst_d, uint64_t off_d, uint64_t n_d,
+        const void *model_map, uint64_t model_size, uint64_t &chunk_idx) {
+    if (!cuda_parallel_expert_read_enabled()) return -1;
+    if (!dst_g || !dst_u || !dst_d || !model_map) return -1;
+    if (g_model_fd < 0 ||
+        (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base)) return -1;
+    if (n_g == 0 || n_u == 0 || n_d == 0) return -1;
+
+    const uint64_t offs[3] = {off_g, off_u, off_d};
+    const uint64_t lens[3] = {n_g, n_u, n_d};
+    char *dsts[3] = {dst_g, dst_u, dst_d};
+    for (int i = 0; i < 3; i++) {
+        if (offs[i] > model_size || lens[i] > model_size - offs[i]) return -1;
+    }
+
+    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    if (n_g > chunk || n_u > chunk || n_d > chunk) return -1;
+    const uint64_t stage_bytes =
+        chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    if (!cuda_stream_selected_stage_pool_alloc(stage_bytes)) return 0;
+    if (!cuda_tensor_readers_ensure()) return -1;
+
+    const uint64_t bi[3] = {chunk_idx % 4u, (chunk_idx + 1u) % 4u, (chunk_idx + 2u) % 4u};
+    for (int i = 0; i < 3; i++) {
+        if (chunk_idx + (uint64_t)i < 4u) continue;
+        const cudaError_t e = cudaEventSynchronize(g_stream_selected_stage_event[bi[i]]);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA parallel expert staging wait failed: %s\n",
+                    cudaGetErrorString(e));
+            (void)cudaGetLastError();
+            return 0;
+        }
+    }
+
+    cuda_tensor_read_job jobs[3];
+    for (int i = 0; i < 3; i++) {
+        jobs[i].stage = g_stream_selected_stage[bi[i]];
+        jobs[i].stage_bytes = g_stream_selected_stage_bytes;
+        jobs[i].offset = offs[i];
+        jobs[i].bytes = lens[i];
+        jobs[i].payload = NULL;
+        jobs[i].ok = 0;
+    }
+
+    pthread_mutex_lock(&g_tensor_readers_lock);
+    for (int i = 0; i < 2; i++) {
+        g_tensor_readers[i].job = &jobs[i + 1];
+        sem_post(&g_tensor_readers[i].start);
+    }
+    t_in_expert_read = 1;
+    jobs[0].ok = cuda_model_stage_read(jobs[0].stage, jobs[0].stage_bytes,
+                                       jobs[0].offset, jobs[0].bytes, &jobs[0].payload);
+    t_in_expert_read = 0;
+    for (int i = 0; i < 2; i++) sem_wait(&g_tensor_readers[i].done);
+    pthread_mutex_unlock(&g_tensor_readers_lock);
+
+    for (int i = 0; i < 3; i++) {
+        if (!jobs[i].ok) {
+            fprintf(stderr, "ds4: CUDA parallel expert read failed at tensor %d: %s\n",
+                    i, strerror(errno));
+            return 0;
+        }
+    }
+
+    for (int i = 0; i < 3; i++) {
+        cudaError_t e = cudaMemcpyAsync(dsts[i], jobs[i].payload, (size_t)lens[i],
+                                        cudaMemcpyHostToDevice,
+                                        g_stream_selected_upload_stream);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA parallel expert copy failed: %s\n",
+                    cudaGetErrorString(e));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        e = cudaEventRecord(g_stream_selected_stage_event[bi[i]],
+                            g_stream_selected_upload_stream);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA parallel expert staging record failed: %s\n",
+                    cudaGetErrorString(e));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        cuda_model_drop_file_pages(offs[i], lens[i]);
+        cuda_model_discard_source_pages(model_map, model_size, offs[i], lens[i]);
+    }
+    chunk_idx += 3u;
     return 1;
 }
 
@@ -27266,7 +27655,13 @@ static int cuda_stream_selected_cache_begin_load(
             const uint64_t up = table->up_offset + expert * table->gate_expert_bytes;
             const uint64_t down = table->down_offset + expert * table->down_expert_bytes;
             uploads.active = true;
-            if (!cuda_model_copy_to_device_streamed(
+            const int par = cuda_model_copy_expert_parallel(
+                cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes, gate, table->gate_expert_bytes,
+                cache.up_ptr   + (uint64_t)victim * table->gate_expert_bytes, up,   table->gate_expert_bytes,
+                cache.down_ptr + (uint64_t)victim * table->down_expert_bytes, down, table->down_expert_bytes,
+                table->model_map, table->model_size, uploads.chunks);
+            if (par == 0) return 0;
+            if (par < 0 && (!cuda_model_copy_to_device_streamed(
                     cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
                     table->model_map, table->model_size, gate, table->gate_expert_bytes, "stream gate", uploads.chunks) ||
                 !cuda_model_copy_to_device_streamed(
@@ -27274,7 +27669,7 @@ static int cuda_stream_selected_cache_begin_load(
                     table->model_map, table->model_size, up, table->gate_expert_bytes, "stream up", uploads.chunks) ||
                 !cuda_model_copy_to_device_streamed(
                     cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
-                    table->model_map, table->model_size, down, table->down_expert_bytes, "stream down", uploads.chunks))
+                    table->model_map, table->model_size, down, table->down_expert_bytes, "stream down", uploads.chunks)))
                 return 0;
             slot = {gate, up, down, stamp};
             g_stream_expert_by_gate[gate] = victim;

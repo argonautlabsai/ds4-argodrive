@@ -70013,6 +70013,12 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
         return false;
     }
     if (budget > recommended) budget = recommended;
+    /* SSD-streaming experts live in VRAM, not host RAM; when the GPU has
+     * spare VRAM the host-RAM budget must not shrink the expert cache.
+     * DS4_STREAMING_CACHE_IGNORE_HOST_BUDGET lets it bind on the VRAM /
+     * cacheable-count clamps instead (default off = original behavior). */
+    const bool ignore_host_cache = e->ssd_streaming &&
+        getenv("DS4_STREAMING_CACHE_IGNORE_HOST_BUDGET") != NULL;
     uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
     if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
     weights = ds4_add_sat_u64(weights, e->vision_model.size);
@@ -70020,13 +70026,13 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
         ds4_add_sat_u64(graph_bytes, 2u * gib + e->ssd_streaming_prefill_headroom_bytes));
     uint64_t expert = 0;
     if (e->ssd_streaming && !ds4_streaming_routed_expert_bytes(&e->weights, &expert)) return false;
-    if (fixed >= budget || (expert && budget - fixed < expert)) {
+    if (fixed >= budget || (!ignore_host_cache && expert && budget - fixed < expert)) {
         fprintf(stderr, "ds4: V4.1 needs %.2f GiB before the expert cache; safe budget %.2f GiB. "
                         "Use --ssd-streaming or a smaller context.\n",
                 ds4_bytes_to_gib(fixed), ds4_bytes_to_gib(budget));
         return false;
     }
-    if (expert && e->ssd_streaming_cache_experts > (budget - fixed) / expert) {
+    if (!ignore_host_cache && expert && e->ssd_streaming_cache_experts > (budget - fixed) / expert) {
         if (!fit_cache) {
             fprintf(stderr, "ds4: no room for another V4.1 session; reduce context or the SSD expert cache\n");
             return false;
