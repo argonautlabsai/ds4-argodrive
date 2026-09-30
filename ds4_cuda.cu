@@ -24,6 +24,7 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <ctime>
 
 #include "cuda/mmq/ds4_mmq.h"
 #include "cuda/mmq/ds4_repack.h"
@@ -27526,6 +27527,295 @@ struct cuda_stream_upload_batch {
     ~cuda_stream_upload_batch() { (void)finish(); }
 };
 
+/* ---------------------------------------------------------------------------
+ * Host-RAM second-level expert cache (Linux / CUDA, discrete GPUs).
+ *
+ * Default OFF: with DS4_CUDA_HOST_EXPERT_CACHE_GB unset every entry point here
+ * returns -1 and the caller runs the unmodified SSD path, byte for byte.
+ *
+ * Rationale. On unified-memory Apple hardware the VRAM expert cache already is
+ * host RAM, so no second tier exists. On a discrete card the two are separate
+ * and host RAM sits idle (measured on this box: 52 GiB idle of 58, while every
+ * expert miss pays a 1.58 ms NVMe read). A pinned host slot serves as BOTH the
+ * staging buffer for that read AND a cache line, so a miss costs exactly what
+ * it costs today, while a hit replaces the NVMe read with a host-to-device DMA
+ * of about 0.4 ms for a 19 MiB expert on PCIe Gen5 x16.
+ *
+ * Called only from the miss loop of cuda_stream_selected_cache_begin_load,
+ * which is single-threaded, so no locking is needed here.
+ * ------------------------------------------------------------------------- */
+struct cuda_host_expert_slot {
+    uint64_t gate = 0, up = 0, down = 0, used = 0;
+    const char *pg = NULL, *pu = NULL, *pd = NULL;
+    int pinned = 0; /* preloaded from a popularity ranking; never evicted */
+};
+static std::vector<void *> g_host_tier_chunks;
+static std::vector<cuda_host_expert_slot> g_host_tier_slots;
+static std::unordered_map<uint64_t, uint32_t> g_host_tier_by_gate;
+static uint64_t g_host_tier_clock = 1;
+static uint64_t g_host_tier_slot_bytes = 0, g_host_tier_slots_per_chunk = 0;
+static uint64_t g_host_tier_gate_span = 0, g_host_tier_down_span = 0;
+static uint64_t g_host_tier_gate_bytes = 0, g_host_tier_down_bytes = 0;
+static uint64_t g_host_tier_hits = 0, g_host_tier_reads = 0, g_host_tier_loads = 0;
+/* Miss histogram: how concentrated are the misses that get past the VRAM cache?
+ * This predicts the hit rate an oracle popularity-ranked pool of N slots would reach,
+ * which is the number that decides whether a tier-two pool is worth building at all. */
+struct cuda_host_miss_stat { uint64_t count = 0, up = 0, down = 0; };
+static std::unordered_map<uint64_t, cuda_host_miss_stat> g_host_tier_miss_hist;
+static uint64_t g_host_tier_pinned = 0;
+static int g_host_tier_state = 0; /* 0 untried, 1 active, -1 disabled */
+
+static void cuda_host_expert_tier_report(void) {
+    if (!g_host_tier_loads) return;
+    (void)fflush(stderr);
+    const uint64_t served = g_host_tier_hits + g_host_tier_reads;
+    fprintf(stderr,
+            "ds4: expert tier stats: vram_misses=%llu host_hits=%llu host_reads=%llu "
+            "host_hit_rate=%.1f%% host_slots=%zu\n",
+            (unsigned long long)g_host_tier_loads,
+            (unsigned long long)g_host_tier_hits,
+            (unsigned long long)g_host_tier_reads,
+            served ? 100.0 * (double)g_host_tier_hits / (double)served : 0.0,
+            g_host_tier_slots.size());
+    if (g_host_tier_miss_hist.empty()) return;
+    std::vector<uint64_t> counts;
+    counts.reserve(g_host_tier_miss_hist.size());
+    uint64_t total = 0;
+    for (const auto &kv : g_host_tier_miss_hist) { counts.push_back(kv.second.count); total += kv.second.count; }
+    std::sort(counts.begin(), counts.end(), std::greater<uint64_t>());
+    const uint32_t marks[5] = {862u, 2156u, 4000u, 8000u, 0u};
+    fprintf(stderr, "ds4: miss concentration: %llu misses over %zu distinct experts;"
+                    " share captured by the top N most-missed:",
+            (unsigned long long)total, g_host_tier_miss_hist.size());
+    for (int m = 0; marks[m]; m++) {
+        uint64_t acc = 0;
+        const size_t lim = std::min((size_t)marks[m], counts.size());
+        for (size_t i = 0; i < lim; i++) acc += counts[i];
+        fprintf(stderr, " N=%u:%.1f%%", marks[m], total ? 100.0 * (double)acc / (double)total : 0.0);
+    }
+    fprintf(stderr, "  (max single expert %llu hits)\n",
+            (unsigned long long)(counts.empty() ? 0 : counts[0]));
+    (void)fflush(stderr);
+    const char *dump = getenv("DS4_CUDA_HOST_TIER_DUMP");
+    if (!dump || !*dump) return;
+    std::vector<std::pair<uint64_t, cuda_host_miss_stat>> rank(
+        g_host_tier_miss_hist.begin(), g_host_tier_miss_hist.end());
+    std::sort(rank.begin(), rank.end(),
+              [](const std::pair<uint64_t, cuda_host_miss_stat> &a,
+                 const std::pair<uint64_t, cuda_host_miss_stat> &b) {
+                  if (a.second.count != b.second.count) return a.second.count > b.second.count;
+                  return a.first < b.first;
+              });
+    FILE *f = fopen(dump, "w");
+    if (!f) { fprintf(stderr, "ds4: host tier dump: cannot write %s\n", dump); return; }
+    fprintf(f, "# gate up down misses  (ranked by misses, most first)\n");
+    for (const auto &e : rank)
+        fprintf(f, "%llu %llu %llu %llu\n", (unsigned long long)e.first,
+                (unsigned long long)e.second.up, (unsigned long long)e.second.down,
+                (unsigned long long)e.second.count);
+    (void)fclose(f);
+    fprintf(stderr, "ds4: host tier ranking written to %s (%zu experts)\n", dump, rank.size());
+}
+
+static int cuda_host_expert_tier_fill(cuda_host_expert_slot &s,
+                                      const ds4_gpu_stream_expert_table *table,
+                                      uint64_t gate, uint64_t up, uint64_t down, char *base);
+
+static char *cuda_host_expert_tier_base(uint32_t slot) {
+    if (!g_host_tier_slots_per_chunk) return NULL;
+    const size_t chunk = (size_t)(slot / g_host_tier_slots_per_chunk);
+    if (chunk >= g_host_tier_chunks.size()) return NULL;
+    const uint64_t within = (uint64_t)(slot % g_host_tier_slots_per_chunk);
+    return (char *)g_host_tier_chunks[chunk] + within * g_host_tier_slot_bytes;
+}
+
+static int cuda_host_expert_tier_init(const ds4_gpu_stream_expert_table *table) {
+    if (g_host_tier_state) {
+        /* Expert geometry must not change under a sized tier. */
+        if (g_host_tier_state > 0 &&
+            (table->gate_expert_bytes != g_host_tier_gate_bytes ||
+             table->down_expert_bytes != g_host_tier_down_bytes)) {
+            fprintf(stderr, "ds4: host expert tier disabled: expert geometry changed\n");
+            g_host_tier_state = -1;
+        }
+        return g_host_tier_state;
+    }
+    static int registered = 0;
+    if (!registered) { registered = 1; atexit(cuda_host_expert_tier_report); }
+    const char *env = getenv("DS4_CUDA_HOST_EXPERT_CACHE_GB");
+    if (!env || !*env) { g_host_tier_state = -1; return -1; }
+    char *end = NULL;
+    const double want_gb = strtod(env, &end);
+    if (end == env || !(want_gb > 0.0)) { g_host_tier_state = -1; return -1; }
+
+    const uint64_t align = g_model_direct_align > 1 ? g_model_direct_align : 1u;
+    const uint64_t g = table->gate_expert_bytes, d = table->down_expert_bytes;
+    if (!g || !d) { g_host_tier_state = -1; return -1; }
+    /* Direct I/O refuses an unaligned destination, and the engine answers that
+     * refusal by closing the direct fd for the whole process, so every component
+     * needs its own aligned region rather than being packed end to end. */
+    g_host_tier_gate_span = cuda_round_up(g + align, align);
+    g_host_tier_down_span = cuda_round_up(d + align, align);
+    g_host_tier_slot_bytes = 2u * g_host_tier_gate_span + g_host_tier_down_span;
+    const uint64_t want = (uint64_t)(want_gb * 1073741824.0);
+    uint64_t slots = want / g_host_tier_slot_bytes;
+    if (!slots) {
+        fprintf(stderr, "ds4: host expert tier needs at least %.2f GiB for one expert\n",
+                (double)g_host_tier_slot_bytes / 1073741824.0);
+        g_host_tier_state = -1; return -1;
+    }
+    /* One chunk per ~1 GiB keeps each cudaMallocHost request modest. */
+    g_host_tier_slots_per_chunk = (1073741824ull / g_host_tier_slot_bytes);
+    if (!g_host_tier_slots_per_chunk) g_host_tier_slots_per_chunk = 1;
+    uint64_t done = 0;
+    while (done < slots) {
+        const uint64_t n = std::min(g_host_tier_slots_per_chunk, slots - done);
+        void *mem = NULL;
+        if (cudaMallocHost(&mem, (size_t)(n * g_host_tier_slot_bytes)) != cudaSuccess || !mem) {
+            (void)cudaGetLastError();
+            fprintf(stderr, "ds4: host expert tier stopped at %.2f GiB (pinning refused more)\n",
+                    (double)(done * g_host_tier_slot_bytes) / 1073741824.0);
+            slots = done;
+            break;
+        }
+        g_host_tier_chunks.push_back(mem);
+        done += n;
+        if (n < g_host_tier_slots_per_chunk) break;
+    }
+    if (!slots) {
+        for (void *m : g_host_tier_chunks) (void)cudaFreeHost(m);
+        g_host_tier_chunks.clear();
+        g_host_tier_state = -1; return -1;
+    }
+    g_host_tier_slots.assign((size_t)slots, cuda_host_expert_slot());
+    g_host_tier_by_gate.clear();
+    g_host_tier_by_gate.reserve((size_t)slots * 2u);
+    g_host_tier_gate_bytes = g;
+    g_host_tier_down_bytes = d;
+    g_host_tier_state = 1;
+    fprintf(stderr, "ds4: host expert tier: %llu slots, %.2f GiB pinned (%.2f MiB per expert)\n",
+            (unsigned long long)slots,
+            (double)(slots * g_host_tier_slot_bytes) / 1073741824.0,
+            (double)g_host_tier_slot_bytes / 1048576.0);
+    /* A popularity-ranked preload is the whole point: filling on demand makes this a
+     * victim cache holding whatever the VRAM LRU just judged coldest, which measured a
+     * 3.6% hit rate, while the top 2156 experts by miss count carry 39.5% of misses. */
+    const char *warm = getenv("DS4_CUDA_HOST_TIER_LOAD");
+    if (warm && *warm) {
+        FILE *f = fopen(warm, "r");
+        if (!f) {
+            fprintf(stderr, "ds4: host tier preload: cannot read %s\n", warm);
+        } else {
+            const double t0 = (double)clock() / (double)CLOCKS_PER_SEC;
+            char line[256];
+            uint64_t filled = 0, skipped = 0;
+            while (filled < slots && fgets(line, sizeof(line), f)) {
+                if (line[0] == '#' || line[0] == '\n') continue;
+                unsigned long long lg = 0, lu = 0, ld = 0, lc = 0;
+                if (sscanf(line, "%llu %llu %llu %llu", &lg, &lu, &ld, &lc) != 4) continue;
+                char *base = cuda_host_expert_tier_base((uint32_t)filled);
+                if (!base) break;
+                cuda_host_expert_slot cand;
+                if (!cuda_host_expert_tier_fill(cand, table, lg, lu, ld, base)) { skipped++; continue; }
+                cand.gate = lg; cand.up = lu; cand.down = ld;
+                cand.used = UINT64_MAX;
+                cand.pinned = 1;
+                g_host_tier_slots[(size_t)filled] = cand;
+                g_host_tier_by_gate[lg] = (uint32_t)filled;
+                filled++;
+            }
+            (void)fclose(f);
+            g_host_tier_pinned = filled;
+            fprintf(stderr, "ds4: host tier preloaded %llu experts (%.2f GiB) from %s in %.1fs"
+                            " (%llu unreadable)\n",
+                    (unsigned long long)filled,
+                    (double)(filled * g_host_tier_slot_bytes) / 1073741824.0, warm,
+                    (double)clock() / (double)CLOCKS_PER_SEC - t0,
+                    (unsigned long long)skipped);
+        }
+    }
+    return 1;
+}
+
+static int cuda_host_expert_tier_fill(cuda_host_expert_slot &s,
+                                      const ds4_gpu_stream_expert_table *table,
+                                      uint64_t gate, uint64_t up, uint64_t down, char *base) {
+    const uint64_t g = table->gate_expert_bytes, d = table->down_expert_bytes;
+    char *bg = base;
+    char *bu = base + g_host_tier_gate_span;
+    char *bd = base + 2u * g_host_tier_gate_span;
+    const char *pg = NULL, *pu = NULL, *pd = NULL;
+    if (!cuda_model_stage_read(bg, g_host_tier_gate_span, gate, g, &pg)) return 0;
+    if (!cuda_model_stage_read(bu, g_host_tier_gate_span, up,   g, &pu)) return 0;
+    if (!cuda_model_stage_read(bd, g_host_tier_down_span, down, d, &pd)) return 0;
+    s.pg = pg; s.pu = pu; s.pd = pd;
+    return 1;
+}
+
+static int cuda_host_expert_tier_upload(const cuda_host_expert_slot &s,
+                                        char *dg, char *du, char *dd,
+                                        const ds4_gpu_stream_expert_table *table) {
+    const uint64_t g = table->gate_expert_bytes, d = table->down_expert_bytes;
+    cudaStream_t st = g_stream_selected_upload_stream;
+    if (st) {
+        if (!cuda_ok(cudaMemcpyAsync(dg, s.pg, (size_t)g, cudaMemcpyHostToDevice, st), "host tier gate")) return 0;
+        if (!cuda_ok(cudaMemcpyAsync(du, s.pu, (size_t)g, cudaMemcpyHostToDevice, st), "host tier up")) return 0;
+        if (!cuda_ok(cudaMemcpyAsync(dd, s.pd, (size_t)d, cudaMemcpyHostToDevice, st), "host tier down")) return 0;
+        return 1;
+    }
+    if (!cuda_ok(cudaMemcpy(dg, s.pg, (size_t)g, cudaMemcpyHostToDevice), "host tier gate")) return 0;
+    if (!cuda_ok(cudaMemcpy(du, s.pu, (size_t)g, cudaMemcpyHostToDevice), "host tier up")) return 0;
+    if (!cuda_ok(cudaMemcpy(dd, s.pd, (size_t)d, cudaMemcpyHostToDevice), "host tier down")) return 0;
+    return 1;
+}
+
+/* 1 = expert is now in the device slot, 0 = hard failure, -1 = tier not used. */
+static int cuda_host_expert_tier_load(char *dg, char *du, char *dd,
+                                      const ds4_gpu_stream_expert_table *table,
+                                      uint64_t gate, uint64_t up, uint64_t down) {
+    g_host_tier_loads++; /* counts every VRAM miss, whether the tier is on or not */
+    { cuda_host_miss_stat &st = g_host_tier_miss_hist[gate];
+      st.count++; st.up = up; st.down = down; }
+    /* atexit does not run when the server is signalled, so report periodically. */
+    if (g_host_tier_loads % 20000u == 0u) cuda_host_expert_tier_report();
+    if (cuda_host_expert_tier_init(table) < 0) return -1;
+    const uint64_t stamp = ++g_host_tier_clock;
+    const auto it = g_host_tier_by_gate.find(gate);
+    if (it != g_host_tier_by_gate.end()) {
+        cuda_host_expert_slot &hit = g_host_tier_slots[it->second];
+        if (hit.up == up && hit.down == down && hit.pg && hit.pu && hit.pd) {
+            if (!cuda_host_expert_tier_upload(hit, dg, du, dd, table)) return 0;
+            hit.used = stamp;
+            g_host_tier_hits++;
+            return 1;
+        }
+        g_host_tier_by_gate.erase(it);
+    }
+    uint32_t victim = UINT32_MAX;
+    uint64_t oldest = UINT64_MAX;
+    for (uint32_t i = 0; i < (uint32_t)g_host_tier_slots.size(); i++) {
+        if (g_host_tier_slots[i].pinned) continue;
+        if (g_host_tier_slots[i].used < oldest) {
+            oldest = g_host_tier_slots[i].used;
+            victim = i;
+            if (!oldest) break;
+        }
+    }
+    /* Every slot pinned by the ranking: leave them alone and read as usual. */
+    if (victim == UINT32_MAX) return -1;
+    cuda_host_expert_slot &slot = g_host_tier_slots[victim];
+    if (slot.used) g_host_tier_by_gate.erase(slot.gate);
+    slot = cuda_host_expert_slot();
+    char *base = cuda_host_expert_tier_base(victim);
+    /* A fill failure is not fatal: fall back to the stock read path. */
+    if (!base || !cuda_host_expert_tier_fill(slot, table, gate, up, down, base)) return -1;
+    if (!cuda_host_expert_tier_upload(slot, dg, du, dd, table)) return 0;
+    slot.gate = gate; slot.up = up; slot.down = down; slot.used = stamp;
+    g_host_tier_by_gate[gate] = victim;
+    g_host_tier_reads++;
+    return 1;
+}
+
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
@@ -27655,7 +27945,13 @@ static int cuda_stream_selected_cache_begin_load(
             const uint64_t up = table->up_offset + expert * table->gate_expert_bytes;
             const uint64_t down = table->down_offset + expert * table->down_expert_bytes;
             uploads.active = true;
-            const int par = cuda_model_copy_expert_parallel(
+            const int htier = cuda_host_expert_tier_load(
+                cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
+                cache.up_ptr   + (uint64_t)victim * table->gate_expert_bytes,
+                cache.down_ptr + (uint64_t)victim * table->down_expert_bytes,
+                table, gate, up, down);
+            if (htier == 0) return 0;
+            const int par = (htier > 0) ? 1 : cuda_model_copy_expert_parallel(
                 cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes, gate, table->gate_expert_bytes,
                 cache.up_ptr   + (uint64_t)victim * table->gate_expert_bytes, up,   table->gate_expert_bytes,
                 cache.down_ptr + (uint64_t)victim * table->down_expert_bytes, down, table->down_expert_bytes,
