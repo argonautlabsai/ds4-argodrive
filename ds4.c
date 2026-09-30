@@ -40725,6 +40725,61 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
            ds41_bf16(g->block, DS4_N_EMBD);
 }
 
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+/* ---- V4.1 decode read-ahead (CUDA) ----------------------------------------------
+ * Port of the fork's Metal DS4_ARGODRIVE_DECODE_AHEAD: predict layer il+1's routed
+ * experts by running il+1's router on this layer's normalised MoE input, and hand
+ * the prediction to the CUDA streaming cache, which reads it back in the drain the
+ * demand load already performs and fetches the misses while this layer's MoE runs.
+ * Nothing here changes what the model computes; a wrong guess costs one cold slot.
+ * Gated by DS4_CUDA_DECODE_AHEAD=1 or DS4_CUDA_LOOKAHEAD_PROBE=1 (stats only). */
+static ds4_gpu_tensor *g_la_logits, *g_la_probs, *g_la_selected, *g_la_weights;
+static const ds4_weights *g_la_weights_ptr;
+static int la_active(void) {
+    static int checked, on;
+    if (!checked) {
+        const char *a = getenv("DS4_CUDA_DECODE_AHEAD"), *p = getenv("DS4_CUDA_LOOKAHEAD_PROBE");
+        on = (a && strcmp(a, "0") != 0) || (p && strcmp(p, "0") != 0);
+        checked = 1;
+    }
+    return on;
+}
+/* Encode il+1's router on g->norm and arm the cache. Silent on failure by design. */
+static void la_encode_and_arm(ds41_gpu_graph *g, const ds4_model *m, uint32_t il, uint32_t token) {
+    const ds4_weights *w = g_la_weights_ptr;
+    if (!w || il + 1u >= DS4_N_LAYER) return;
+    const ds4_layer_weights *ln = &w->layer[il + 1u];
+    const ds4_tensor *nbias = ds41_image_at(g, g->pos) ? ln->ffn_exp_probs_vl : ln->ffn_exp_probs_b;
+    if (!ln->ffn_gate_inp || !nbias || !ln->ffn_gate_exps || !ln->ffn_up_exps || !ln->ffn_down_exps) return;
+    if (!g_la_logits) {
+        g_la_logits   = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+        g_la_probs    = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+        g_la_selected = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+        g_la_weights  = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+        if (!g_la_logits || !g_la_probs || !g_la_selected || !g_la_weights) return;
+    }
+    if (!ds41_matmul(g_la_logits, m, ln->ffn_gate_inp, g->norm, false)) return;
+    if (!ds4_gpu_router_select_tensor(g_la_selected, g_la_weights, g_la_probs,
+            m->map, m->size, nbias->abs_offset, 0, 0, token,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
+            g_la_logits)) return;
+    uint64_t gate_row = 0, down_row = 0;
+    if (!tensor_nbytes(ln->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
+        !tensor_nbytes(ln->ffn_down_exps->type, DS4_N_FF_EXP, &down_row)) return;
+    const ds4_gpu_stream_expert_table nt = {
+        .model_map = m->map, .model_size = m->size, .layer = il + 1u,
+        .n_total_expert = DS4_N_EXPERT,
+        .gate_offset = ln->ffn_gate_exps->abs_offset,
+        .up_offset   = ln->ffn_up_exps->abs_offset,
+        .down_offset = ln->ffn_down_exps->abs_offset,
+        .gate_expert_bytes = gate_row * DS4_N_FF_EXP,
+        .down_expert_bytes = down_row * DS4_N_EMBD,
+    };
+    ds4_gpu_stream_expert_lookahead_arm(&nt, g_la_selected, g_la_weights, DS4_N_EXPERT_USED);
+}
+#endif
+
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
     uint64_t gate_row = 0, down_row = 0;
@@ -40740,6 +40795,10 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    if (g->streaming && g->tp_world == 1 && !g->quality && !g->imatrix && la_active())
+        la_encode_and_arm(g, m, il, token);
+#endif
     const bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
     bool shared_queued = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -41265,6 +41324,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
     const bool queue_layers = g->tp_world == 2 && !g->imatrix &&
         !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    g_la_weights_ptr = w;
+#endif
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)

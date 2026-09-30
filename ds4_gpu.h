@@ -309,6 +309,13 @@ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
         const ds4_gpu_stream_expert_table *table,
         const ds4_gpu_tensor              *selected,
         uint32_t                           n_selected);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* Decode read-ahead: the next layer's predicted routing, consumed by the demand
+ * readback of the current layer (see cuda_spec_* in ds4_cuda.cu). */
+void ds4_gpu_stream_expert_lookahead_arm(const ds4_gpu_stream_expert_table *next,
+                                         const ds4_gpu_tensor *pred, const ds4_gpu_tensor *pred_w,
+                                         uint32_t n_pred);
+#endif
 #ifdef __APPLE__
 /* The async selected-load worker registers itself so Metal cache paths never
  * wait on command buffers from that thread (they fail the load instead and
