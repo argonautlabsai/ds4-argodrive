@@ -40802,7 +40802,9 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     const bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
     bool shared_queued = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (shared_owner && shared_here &&
+    static int shared_async_env = -1;
+    if (shared_async_env < 0) { const char *e = getenv("DS4_CUDA_SHARED_ASYNC"); shared_async_env = e && strcmp(e, "0") != 0; }
+    if ((shared_owner || (shared_async_env && g->tp_world == 1 && g->streaming)) && shared_here &&
         l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
         l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
         l->ffn_down_shexp->type == DS4_TENSOR_Q8_0) {
@@ -41764,8 +41766,11 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #endif
             if (ok) ok = metal_graph_stream_map_layer(m, w, il);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-            /* Below 2K, unused expert reads outweigh the overlap. */
-            if (ok && total_count >= 2048u) {
+            /* Below 2K, unused expert reads outweigh the overlap (upstream default);
+             * DS4_CUDA_SSD_PREFETCH_MIN_TOKENS overrides the threshold for measurement. */
+            static uint32_t prefetch_min = 0;
+            if (!prefetch_min) { const char *e = getenv("DS4_CUDA_SSD_PREFETCH_MIN_TOKENS"); long v = (e && e[0]) ? strtol(e, NULL, 10) : 2048; prefetch_min = v < 1 ? 1u : (uint32_t)v; }
+            if (ok && total_count >= prefetch_min) {
                 const ds4_gpu_stream_expert_table current = graph_stream_expert_table_make(m,
                     &w->layer[il], il,
                     routed_expert_row_bytes(w->layer[il].ffn_gate_exps) * DS4_N_FF_EXP,
