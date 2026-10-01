@@ -208,7 +208,24 @@ static std::unordered_map<uint64_t, uint32_t> g_stream_expert_by_gate;
 static uint64_t g_stream_expert_clock = 1;
 /* Deferred-miss MoE (DS4_CUDA_MOE_DEFER=1): see cuda_routed_moe_deferred(). */
 static int g_moe_skip_load = 0;          /* routed_moe_launch: use the cache as set, do not load */
+/* Decode-only (slot_count == 6) host-side intervals, so the per-token partition is
+ * measured rather than estimated: readback = id copy wait; begin_load = whole host
+ * phase (index, loads, DMA wait, remap); load = read+issue part; upload = DMA wait. */
+static uint64_t g_pd_layers = 0, g_pd_misses = 0;
+static double g_pd_readback_ms = 0, g_pd_begin_ms = 0, g_pd_load_ms = 0, g_pd_upload_ms = 0;
+static void cuda_decode_partition_report(void) {
+    if (!g_pd_layers) return;
+    fprintf(stderr, "ds4: decode partition over %llu layers (%.2f misses/layer): per layer readback %.3f ms, "
+                    "host phase %.3f ms (of which reads+issue %.3f, DMA wait %.3f); per 40 layers: readback %.1f ms, host phase %.1f ms\n",
+            (unsigned long long)g_pd_layers, (double)g_pd_misses / (double)g_pd_layers,
+            g_pd_readback_ms / (double)g_pd_layers, g_pd_begin_ms / (double)g_pd_layers,
+            g_pd_load_ms / (double)g_pd_layers, g_pd_upload_ms / (double)g_pd_layers,
+            40.0 * g_pd_readback_ms / (double)g_pd_layers, 40.0 * g_pd_begin_ms / (double)g_pd_layers);
+    (void)fflush(stderr);
+}
 static int g_begin_load_skip_sync = 0;   /* begin_load: the caller already drained the stream */
+static int g_remap_via_upload_stream = 0; /* begin_load: write the remap through the upload stream (legacy stream is gated) */
+static uint64_t g_chunked_reads = 0, g_chunked_pieces = 0; /* DS4_CUDA_EXPERT_CHUNKS statistics */
 static int g_slot_table_rebuild = 1;     /* host mirror must be rebuilt from the index */
 static int g_slot_table_dirty = 0;       /* mirror changed since the last device copy */
 static int32_t *g_slot_table_h = NULL;   /* pinned host mirror [64][n_total_expert] */
@@ -581,6 +598,20 @@ static uint32_t cuda_expert_readers(void) {
 }
 static uint64_t g_stream_selected_stage_bytes;
 static cudaStream_t g_stream_selected_upload_stream;
+/* DS4_CUDA_UPLOAD_STREAMS=N (1..4): spread the three component copies of an expert over
+ * N non-blocking streams so the copy engines run them in parallel instead of serially on
+ * one stream. Stream 0 is the primary upload stream; the batch finish syncs all of them. */
+static cudaStream_t g_upload_streams_extra[3];
+static uint32_t g_upload_streams_n = 0;
+static uint32_t cuda_upload_streams_wanted(void) {
+    static uint32_t n = 0;
+    if (!n) { const char *e = getenv("DS4_CUDA_UPLOAD_STREAMS"); long v = (e && e[0]) ? strtol(e, NULL, 10) : 1; n = v < 1 ? 1u : (v > 4 ? 4u : (uint32_t)v); }
+    return n;
+}
+static inline cudaStream_t cuda_upload_stream_for(uint32_t i) {
+    if (g_upload_streams_n <= 1 || (i % g_upload_streams_n) == 0) return g_stream_selected_upload_stream;
+    return g_upload_streams_extra[(i % g_upload_streams_n) - 1];
+}
 
 static int cuda_ok(cudaError_t err, const char *what);
 extern "C" void ds4_gpu_decode_graphs_invalidate(void);
@@ -1022,7 +1053,7 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
  *
  * DS4_CUDA_DECODE_GRAPHS=0 (or off/no/false) disables everything. */
 #define CUDA_DECODE_GRAPH_LAYERS   64u
-#define CUDA_DECODE_GRAPH_ISLANDS   3u
+#define CUDA_DECODE_GRAPH_ISLANDS   5u  /* 0,1,2 upstream; 3 = MoE tail, 4 = after-attention (streaming) */
 #define CUDA_DECODE_GRAPH_VARIANTS  4u
 
 /* Mirrors the public `struct ds4_decode_graph_key` decl in ds4_gpu.h
@@ -2687,6 +2718,9 @@ static int cuda_replica_init_locked(void) {
     return 1;
 }
 static void cuda_replica_report(void) {
+    if (g_chunked_reads)
+        fprintf(stderr, "ds4: chunked expert reads: %llu components in %.1f pieces each (DMA issued per piece)\n",
+                (unsigned long long)g_chunked_reads, (double)g_chunked_pieces / (double)g_chunked_reads);
     if (g_subread_calls)
         fprintf(stderr, "ds4: expert sub-reads: %llu component reads split into %.1f parts each, %u helper threads\n",
                 (unsigned long long)g_subread_calls, (double)g_subread_parts / (double)g_subread_calls, g_replica_threads);
@@ -2808,6 +2842,11 @@ static void cuda_stream_selected_stage_release(void) {
         (void)cudaStreamDestroy(g_stream_selected_upload_stream);
         g_stream_selected_upload_stream = NULL;
     }
+    for (uint32_t i = 1; i < g_upload_streams_n; i++) {
+        if (g_upload_streams_extra[i - 1]) (void)cudaStreamDestroy(g_upload_streams_extra[i - 1]);
+        g_upload_streams_extra[i - 1] = NULL;
+    }
+    g_upload_streams_n = 0;
 }
 
 static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
@@ -2821,6 +2860,15 @@ static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
                 cudaGetErrorString(err));
         (void)cudaGetLastError();
         return 0;
+    }
+    g_upload_streams_n = 1;
+    {
+        const uint32_t want = cuda_upload_streams_wanted();
+        for (uint32_t i = 1; i < want; i++) {
+            if (cudaStreamCreateWithFlags(&g_upload_streams_extra[i - 1], cudaStreamNonBlocking) != cudaSuccess) { (void)cudaGetLastError(); break; }
+            g_upload_streams_n = i + 1;
+        }
+        if (g_upload_streams_n > 1) fprintf(stderr, "ds4: expert uploads spread over %u streams\n", g_upload_streams_n);
     }
     for (size_t i = 0; i < (size_t)cuda_stage_ring(); i++) {
         err = cudaMallocHost(&g_stream_selected_stage_raw[i], (size_t)bytes);
@@ -2881,7 +2929,57 @@ struct cuda_tensor_read_job {
     uint64_t bytes;
     const char *payload;
     int ok;
+    /* DS4_CUDA_EXPERT_CHUNKS: when dst is set the reader copies each aligned
+     * piece to the device as soon as it lands, so the DMA runs under the read. */
+    char *dst;
+    uint32_t chunks;
+    cudaStream_t stream;
 };
+static uint32_t cuda_expert_chunks(void) {
+    static uint32_t n = 0;
+    if (!n) { const char *e = getenv("DS4_CUDA_EXPERT_CHUNKS"); long v = (e && e[0]) ? strtol(e, NULL, 10) : 1; n = v < 1 ? 1u : (v > 32 ? 32u : (uint32_t)v); }
+    return n;
+}
+static int cuda_replica_read(int primary_fd, void *dst_v, uint64_t length, uint64_t offset);
+/* Read one component in aligned pieces, copying each piece's payload to the device
+ * as it lands. Same bytes, same final layout as the single read. Falls back to the
+ * single read + one copy when direct I/O is off or the range is odd. */
+static int cuda_stage_read_chunked(cuda_tensor_read_job *j) {
+    const uint64_t align = g_model_direct_align > 1 ? g_model_direct_align : 4096;
+    const uint64_t aligned_off = (j->offset / align) * align;
+    const uint64_t delta = j->offset - aligned_off;
+    const uint64_t total = ((delta + j->bytes + align - 1) / align) * align;
+    const int can_direct = g_model_direct_fd >= 0 && g_model_file_size != 0 &&
+                           aligned_off + total <= g_model_file_size && total <= j->stage_bytes;
+    if (j->chunks <= 1 || !j->dst || !can_direct) {
+        int ok = cuda_model_stage_read(j->stage, j->stage_bytes, j->offset, j->bytes, &j->payload);
+        if (ok && j->dst)
+            ok = cudaMemcpyAsync(j->dst, j->payload, (size_t)j->bytes, cudaMemcpyHostToDevice, j->stream) == cudaSuccess;
+        if (!ok) (void)cudaGetLastError();
+        return ok;
+    }
+    char *stage = (char *)j->stage;
+    const uint64_t piece = ((total / j->chunks + align - 1) / align) * align;
+    uint64_t pos = 0;
+    while (pos < total) {
+        const uint64_t len = (total - pos) < piece ? (total - pos) : piece;
+        int rr = cuda_replica_read(g_model_direct_fd, stage + pos, len, aligned_off + pos);
+        if (rr < 0) rr = cuda_pread_full(g_model_direct_fd, stage + pos, len, aligned_off + pos);
+        if (!rr) return 0;
+        /* copy the part of this piece that belongs to the component */
+        const uint64_t lo = pos > delta ? pos : delta;
+        const uint64_t hi = (pos + len) < (delta + j->bytes) ? (pos + len) : (delta + j->bytes);
+        if (hi > lo &&
+            cudaMemcpyAsync(j->dst + (lo - delta), stage + lo, (size_t)(hi - lo), cudaMemcpyHostToDevice, j->stream) != cudaSuccess) {
+            (void)cudaGetLastError(); return 0;
+        }
+        pos += len;
+        g_chunked_pieces++;
+    }
+    g_chunked_reads++;
+    j->payload = stage + delta;
+    return 1;
+}
 
 struct cuda_tensor_reader {
     pthread_t th;
@@ -2903,8 +3001,9 @@ static void *cuda_tensor_reader_main(void *arg) {
         sem_wait(&w->start);
         if (w->stop) break;
         cuda_tensor_read_job *j = w->job;
-        j->ok = cuda_model_stage_read(j->stage, j->stage_bytes, j->offset,
-                                      j->bytes, &j->payload);
+        j->ok = j->dst ? cuda_stage_read_chunked(j)
+                       : cuda_model_stage_read(j->stage, j->stage_bytes, j->offset,
+                                               j->bytes, &j->payload);
         sem_post(&w->done);
     }
     return NULL;
@@ -3137,6 +3236,8 @@ static int cuda_model_copy_expert_parallel(
         }
     }
 
+    const uint32_t chunks = cuda_expert_chunks();
+    const int chunked = chunks > 1u && g_stream_selected_upload_stream != NULL;
     cuda_tensor_read_job jobs[3];
     for (int i = 0; i < 3; i++) {
         jobs[i].stage = g_stream_selected_stage[bi[i]];
@@ -3145,6 +3246,9 @@ static int cuda_model_copy_expert_parallel(
         jobs[i].bytes = lens[i];
         jobs[i].payload = NULL;
         jobs[i].ok = 0;
+        jobs[i].dst = chunked ? dsts[i] : NULL;
+        jobs[i].chunks = chunks;
+        jobs[i].stream = g_stream_selected_upload_stream;
     }
 
     pthread_mutex_lock(&g_tensor_readers_lock);
@@ -3153,8 +3257,9 @@ static int cuda_model_copy_expert_parallel(
         sem_post(&g_tensor_readers[i].start);
     }
     t_in_expert_read = 1;
-    jobs[0].ok = cuda_model_stage_read(jobs[0].stage, jobs[0].stage_bytes,
-                                       jobs[0].offset, jobs[0].bytes, &jobs[0].payload);
+    jobs[0].ok = chunked ? cuda_stage_read_chunked(&jobs[0])
+                         : cuda_model_stage_read(jobs[0].stage, jobs[0].stage_bytes,
+                                                 jobs[0].offset, jobs[0].bytes, &jobs[0].payload);
     t_in_expert_read = 0;
     for (int i = 0; i < 2; i++) sem_wait(&g_tensor_readers[i].done);
     pthread_mutex_unlock(&g_tensor_readers_lock);
@@ -3168,9 +3273,12 @@ static int cuda_model_copy_expert_parallel(
     }
 
     for (int i = 0; i < 3; i++) {
-        cudaError_t e = cudaMemcpyAsync(dsts[i], jobs[i].payload, (size_t)lens[i],
-                                        cudaMemcpyHostToDevice,
-                                        g_stream_selected_upload_stream);
+        cudaError_t e = cudaSuccess;
+        if (!chunked) {
+            e = cudaMemcpyAsync(dsts[i], jobs[i].payload, (size_t)lens[i],
+                                cudaMemcpyHostToDevice,
+                                cuda_upload_stream_for((uint32_t)i));
+        }
         if (e != cudaSuccess) {
             fprintf(stderr, "ds4: CUDA parallel expert copy failed: %s\n",
                     cudaGetErrorString(e));
@@ -3178,7 +3286,7 @@ static int cuda_model_copy_expert_parallel(
             return 0;
         }
         e = cudaEventRecord(g_stream_selected_stage_event[bi[i]],
-                            g_stream_selected_upload_stream);
+                            cuda_upload_stream_for((uint32_t)i));
         if (e != cudaSuccess) {
             fprintf(stderr, "ds4: CUDA parallel expert staging record failed: %s\n",
                     cudaGetErrorString(e));
@@ -23465,6 +23573,52 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
     if (lane == 0) out[row] = total;
 }
 
+/* DS4_CUDA_MOE_DOWN_SPLIT6=1: the fused sum6 kernel runs (out_dim/32) blocks that each
+ * walk all six experts serially, so a 5120-row down projection occupies ~160 blocks on
+ * 188 SMs. This variant puts each (row tile, slot) pair in its own block (6x the blocks),
+ * writes per-slot partials with the same lane split, dot and 8-lane reduction, and sums
+ * them in slot order starting from zero, which is exactly the fused kernel's order. */
+__global__ static void moe_down_q4K_split6_partial_kernel(
+        float *partials,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    const uint32_t slot = blockIdx.y;
+    if (row >= out_dim || slot >= 6u) return;
+    const int32_t expert_i = selected[slot];
+    if (expert_i < 0) { if (lane == 0) partials[(uint64_t)slot * out_dim + row] = 0.0f; return; }
+    const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+    const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
+    const bool vec_ok = ((((uintptr_t)down_base | down_row_bytes | down_expert_bytes) & 15u) == 0u);
+    float acc = 0.0f;
+    if (vec_ok) {
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) dev_dot_q4_K_q8_K_block_vec(wr + b, xq + b, &acc);
+    } else {
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
+    }
+    acc = quarter_warp_sum_f32(acc, lane);
+    if (lane == 0) partials[(uint64_t)slot * out_dim + row] = acc;
+}
+__global__ static void moe_down_split6_sum_kernel(float *out, const float *partials, uint32_t out_dim) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= out_dim) return;
+    float total = 0.0f;
+    #pragma unroll
+    for (uint32_t slot = 0; slot < 6u; slot++) total += partials[(uint64_t)slot * out_dim + row];
+    out[row] = total;
+}
+static int cuda_moe_down_split6_enabled(void) {
+    static int checked = 0, on = 0;
+    if (!checked) { const char *e = getenv("DS4_CUDA_MOE_DOWN_SPLIT6"); on = e && strcmp(e, "0") != 0; checked = 1; }
+    return on;
+}
+
 __global__ static void moe_down_q4K_owned_slots_qwarp32_kernel(
         float *down_out,
         const char *down_base,
@@ -26544,7 +26698,16 @@ static int routed_moe_launch(
             if (use_direct_down_sum) {
                 dim3 sgrid((out_dim + 31u) / 32u, n_tokens, 1);
                 if (q4k_path) {
-                    if (n_expert == 6u) {
+                    if (n_expert == 6u && n_tokens == 1u && cuda_moe_down_split6_enabled() &&
+                        down->bytes >= (uint64_t)6u * out_dim * sizeof(float)) {
+                        /* xq lived in down->ptr but is dead once the gate/up kernel has run. */
+                        dim3 pgrid((out_dim + 31u) / 32u, 6u, 1);
+                        moe_down_q4K_split6_partial_kernel<<<pgrid, 256, 0, cuda_decode_stream()>>>(
+                            (float *)down->ptr, down_w, midq, (const int32_t *)selected->ptr,
+                            down_expert_bytes, down_row_bytes, midq_blocks, out_dim);
+                        moe_down_split6_sum_kernel<<<(out_dim + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(
+                            (float *)out->ptr, (const float *)down->ptr, out_dim);
+                    } else if (n_expert == 6u) {
                         moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, 256, 0, cuda_decode_stream()>>>(
                             (float *)out->ptr,
                             down_w,
@@ -27466,6 +27629,167 @@ static int cuda_routed_moe_deferred(
     return 1;
 }
 
+
+/* ---------------------------------------------------------------------------
+ * GPU-gated all-resident fast path (DS4_CUDA_MOE_GATE=1, single-token streaming).
+ *
+ * The router ids never travel through a synchronous cudaMemcpy. A resolve kernel
+ * maps them through the device-side slot mirror, writes the slot ids straight into
+ * the kernel's slot buffer, and publishes ids + miss mask + epoch to host-mapped
+ * memory. A tiny wait kernel then blocks the stream on a host-mapped "go" flag. The
+ * host spins on the epoch (no CUDA call), and: all resident -> stamps the LRU and
+ * releases go at once (the GPU streams into the MoE with no host gap); a miss ->
+ * loads the misses as today, writes the full remap through the upload stream, then
+ * releases go. The MoE is always the ordinary single pass over the right slots, so
+ * the output is bit-identical to the baseline.
+ * ------------------------------------------------------------------------- */
+__global__ static void moe_gate_resolve_kernel(const int32_t *sel, const int32_t *table_layer, int32_t *slot_out,
+                                               volatile int32_t *h_ids, volatile uint32_t *h_mask, volatile uint32_t *h_epoch,
+                                               uint32_t epoch, int n, int n_total) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    uint32_t mask = 0;
+    for (int i = 0; i < n; i++) {
+        const int e = sel[i];
+        const int s = (e >= 0 && e < n_total) ? table_layer[e] : -1;
+        slot_out[i] = s >= 0 ? s : 0;
+        if (s < 0) mask |= 1u << i;
+        h_ids[i] = e;
+    }
+    *h_mask = mask;
+    __threadfence_system();
+    *h_epoch = epoch;
+}
+__global__ static void moe_gate_wait_kernel(volatile uint32_t *go, uint32_t epoch) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    while (*go < epoch) { __nanosleep(400); }
+}
+static struct {
+    int ready;
+    int32_t *h_ids; uint32_t *h_mask, *h_epoch, *h_go;          /* host-mapped */
+    int32_t *d_ids; uint32_t *d_mask, *d_epoch, *d_go;          /* device views */
+    uint32_t epoch;
+    uint64_t layers, fast, miss, fallback, timeouts;
+    double spin_ms, host_ms;
+} g_gate;
+static int cuda_moe_gate_enabled(void) {
+    static int checked = 0, on = 0;
+    if (!checked) { const char *e = getenv("DS4_CUDA_MOE_GATE"); on = e && strcmp(e, "0") != 0; checked = 1; }
+    return on;
+}
+static void cuda_gate_report(void) {
+    if (!g_gate.layers) return;
+    fprintf(stderr, "ds4: gated MoE: layers=%llu all-resident=%llu miss=%llu fallback=%llu timeouts=%llu | host spin (GPU drain) %.3f ms/layer, host phase %.3f ms/layer\n",
+            (unsigned long long)g_gate.layers, (unsigned long long)g_gate.fast, (unsigned long long)g_gate.miss,
+            (unsigned long long)g_gate.fallback, (unsigned long long)g_gate.timeouts,
+            g_gate.spin_ms / (double)g_gate.layers, g_gate.host_ms / (double)g_gate.layers);
+    (void)fflush(stderr);
+}
+static int cuda_gate_init(uint32_t n_total) {
+    if (g_gate.ready) return g_slot_table_n == n_total;
+    void *mem = NULL;
+    if (cudaHostAlloc(&mem, 4096, cudaHostAllocMapped) != cudaSuccess) return 0;
+    memset(mem, 0, 4096);
+    g_gate.h_ids = (int32_t *)mem; g_gate.h_mask = (uint32_t *)((char *)mem + 256);
+    g_gate.h_epoch = (uint32_t *)((char *)mem + 512); g_gate.h_go = (uint32_t *)((char *)mem + 768);
+    void *dp = NULL;
+    if (cudaHostGetDevicePointer(&dp, mem, 0) != cudaSuccess) return 0;
+    g_gate.d_ids = (int32_t *)dp; g_gate.d_mask = (uint32_t *)((char *)dp + 256);
+    g_gate.d_epoch = (uint32_t *)((char *)dp + 512); g_gate.d_go = (uint32_t *)((char *)dp + 768);
+    if (!g_slot_table_h) {
+        if (n_total > 1024u) return 0;
+        const size_t tbytes = (size_t)64 * n_total * sizeof(int32_t);
+        if (cudaHostAlloc(&mem, tbytes, cudaHostAllocDefault) != cudaSuccess) return 0;
+        g_slot_table_h = (int32_t *)mem;
+        if (cudaMalloc(&g_slot_table_d, tbytes) != cudaSuccess) return 0;
+        for (size_t i = 0; i < (size_t)64 * n_total; i++) g_slot_table_h[i] = -1;
+        g_slot_table_n = n_total; g_slot_table_rebuild = 1;
+    }
+    g_gate.epoch = 1;
+    g_gate.ready = 1;
+    atexit(cuda_gate_report);
+    fprintf(stderr, "ds4: GPU-gated all-resident MoE path on (slot mirror 64 x %u)\n", n_total);
+    return 1;
+}
+static int cuda_routed_moe_gated(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim,
+        uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert,
+        uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index) {
+    auto &cache = g_stream_selected_cache;
+    const ds4_gpu_stream_expert_table table = {model_map, model_size, layer_index, n_total_expert,
+        gate_offset, up_offset, down_offset, gate_expert_bytes, down_expert_bytes};
+    if (!cuda_parallel_expert_read_enabled() || !g_stream_selected_upload_stream) return -1;
+    if (!cuda_gate_init(n_total_expert)) return -1;
+    if (layer_index < 64) { g_layer_gate_off[layer_index] = gate_offset; g_layer_gate_seen[layer_index] = 1; }
+    g_layer_gate_expert_bytes = gate_expert_bytes;
+    if (!cache.gate_ptr || cache.model_map != model_map || cache.gate_expert_bytes != gate_expert_bytes ||
+        cache.down_expert_bytes != down_expert_bytes || g_stream_expert_slots.size() < 6 ||
+        !cache.slot_selected_ptr || cache.slot_selected_capacity < 6 * sizeof(int32_t) || layer_index >= 64 ||
+        cache.compact_count == 0 || cache.logical_tier < 0 || n_expert > 16)
+        return -1;
+    if (g_slot_table_rebuild) cuda_slot_table_rebuild_host();
+    const cudaStream_t st = cuda_decode_stream();
+    if (g_slot_table_dirty) {
+        if (!cuda_ok(cudaMemcpyAsync(g_slot_table_d, g_slot_table_h, (size_t)64 * g_slot_table_n * sizeof(int32_t),
+                                     cudaMemcpyHostToDevice, st), "slot mirror copy")) return 0;
+        g_slot_table_dirty = 0;
+    }
+    const uint32_t epoch = ++g_gate.epoch;
+    const double t0 = cuda_now_ms();
+    moe_gate_resolve_kernel<<<1, 32, 0, st>>>((const int32_t *)selected->ptr, g_slot_table_d + (size_t)layer_index * g_slot_table_n,
+        cache.slot_selected_ptr, g_gate.d_ids, g_gate.d_mask, g_gate.d_epoch, epoch, (int)n_expert, (int)n_total_expert);
+    if (!cuda_ok(cudaGetLastError(), "gate resolve launch")) return 0;
+    moe_gate_wait_kernel<<<1, 32, 0, st>>>(g_gate.d_go, epoch);
+    if (!cuda_ok(cudaGetLastError(), "gate wait launch")) { *(volatile uint32_t *)g_gate.h_go = epoch; return 0; }
+    /* The MoE itself, queued behind the gate; it reads the slot buffer the resolve
+     * kernel (hits) or the host (after a miss load) filled. */
+    cache.layer = layer_index; cache.n_total_expert = n_total_expert; cache.slot_count = n_expert;
+    cache.gate_offset = gate_offset; cache.up_offset = up_offset; cache.down_offset = down_offset;
+    cache.slot_selected_tensor.ptr = cache.slot_selected_ptr;
+    cache.slot_selected_tensor.bytes = (uint64_t)n_expert * sizeof(int32_t);
+    cache.valid = 1;
+    g_moe_skip_load = 1;
+    const int rc = routed_moe_launch(out, gate, up, mid, down, model_map, model_size, gate_offset, up_offset, down_offset,
+                                     gate_type, down_type, gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                                     expert_in_dim, expert_mid_dim, out_dim, selected, weights, n_total_expert, n_expert, clamp, x,
+                                     layer_index, 1, 1, 0);
+    g_moe_skip_load = 0;
+    if (!rc) { *(volatile uint32_t *)g_gate.h_go = epoch; return 0; }
+    /* Wait for the resolve kernel's publication: this is the GPU drain, no CUDA call. */
+    {
+        long spins = 0;
+        while (*(volatile uint32_t *)g_gate.h_epoch != epoch) {
+            if ((++spins & 0xffff) == 0 && cuda_now_ms() - t0 > 10000.0) {
+                g_gate.timeouts++; *(volatile uint32_t *)g_gate.h_go = epoch;
+                fprintf(stderr, "ds4: gated MoE: resolve did not publish within 10 s (layer %u)\n", layer_index);
+                return 0;
+            }
+        }
+    }
+    const double t1 = cuda_now_ms();
+    g_gate.spin_ms += t1 - t0;
+    g_gate.layers++;
+    int32_t ids[16];
+    for (uint32_t i = 0; i < n_expert; i++) ids[i] = ((volatile int32_t *)g_gate.h_ids)[i];
+    const uint32_t mask = *(volatile uint32_t *)g_gate.h_mask;
+    int ok = 1;
+    if (mask == 0 && cuda_stream_cache_touch(&table, ids, n_expert)) {
+        g_gate.fast++;
+    } else {
+        if (mask == 0) g_gate.fallback++; else g_gate.miss++;
+        g_begin_load_skip_sync = 1; g_remap_via_upload_stream = 1;
+        ok = cuda_stream_selected_cache_begin_load(&table, ids, n_expert);
+        g_begin_load_skip_sync = 0; g_remap_via_upload_stream = 0;
+        /* cache.valid/layer were re-set by begin_load; the slot buffer now holds the full remap. */
+    }
+    *(volatile uint32_t *)g_gate.h_go = epoch;   /* release the stream, success or not */
+    g_gate.host_ms += cuda_now_ms() - t1;
+    if (g_gate.layers % 40000u == 0u) cuda_gate_report();
+    return ok ? 1 : 0;
+}
+
 extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *add_in,
         uint32_t layer_index,
@@ -27473,6 +27797,15 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
     if (add_in) {
         if (!ds4_gpu_add_tensor(out, out, add_in,
                                 (uint32_t)(out->bytes / sizeof(float)))) return 0;
+    }
+    if (cuda_moe_gate_enabled() && g_ssd_streaming_mode && !force_resident && g_n_gpus == 1 &&
+        n_expert == 6u && gate_type == 12u && down_type == 12u && !g_dsv41_shared.active) {
+        const int rc = cuda_routed_moe_gated(out, gate, up, mid, down, model_map, model_size,
+                                             gate_offset, up_offset, down_offset, gate_type, down_type,
+                                             gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                                             expert_in_dim, expert_mid_dim, out_dim, selected, weights,
+                                             n_total_expert, n_expert, clamp, x, layer_index);
+        if (rc >= 0) return rc;
     }
     if (cuda_moe_defer_enabled() && g_ssd_streaming_mode && !force_resident && g_n_gpus == 1 &&
         n_expert == 6u && gate_type == 12u && down_type == 12u && !g_dsv41_shared.active) {
@@ -28242,9 +28575,11 @@ struct cuda_stream_upload_batch {
     int finish() {
         if (!active) return 1;
         active = false;
-        if (!g_stream_selected_upload_stream || cuda_ok(
-                cudaStreamSynchronize(g_stream_selected_upload_stream), "stream expert batch upload"))
-            return 1;
+        bool synced = !g_stream_selected_upload_stream ||
+                      cuda_ok(cudaStreamSynchronize(g_stream_selected_upload_stream), "stream expert batch upload");
+        for (uint32_t i = 1; synced && i < g_upload_streams_n; i++)
+            synced = cuda_ok(cudaStreamSynchronize(g_upload_streams_extra[i - 1]), "stream expert batch upload (extra)");
+        if (synced) return 1;
         /* A failed asynchronous copy must not turn into a cache hit later. */
         ds4_gpu_stream_expert_cache_prefetch_finish(true);
         cuda_spec_reap(1);
@@ -28361,6 +28696,7 @@ static void cuda_stall_report(void) {
     (void)fflush(stderr);
     cuda_spec_report();
     cuda_replica_report();
+    cuda_decode_partition_report();
 }
 
 static void cuda_host_expert_tier_report(void) {
@@ -28596,9 +28932,9 @@ static int cuda_host_expert_tier_upload(const cuda_host_expert_slot &s,
     const uint64_t g = table->gate_expert_bytes, d = table->down_expert_bytes;
     cudaStream_t st = g_stream_selected_upload_stream;
     if (st) {
-        if (!cuda_ok(cudaMemcpyAsync(dg, s.pg, (size_t)g, cudaMemcpyHostToDevice, st), "host tier gate")) return 0;
-        if (!cuda_ok(cudaMemcpyAsync(du, s.pu, (size_t)g, cudaMemcpyHostToDevice, st), "host tier up")) return 0;
-        if (!cuda_ok(cudaMemcpyAsync(dd, s.pd, (size_t)d, cudaMemcpyHostToDevice, st), "host tier down")) return 0;
+        if (!cuda_ok(cudaMemcpyAsync(dg, s.pg, (size_t)g, cudaMemcpyHostToDevice, cuda_upload_stream_for(0)), "host tier gate")) return 0;
+        if (!cuda_ok(cudaMemcpyAsync(du, s.pu, (size_t)g, cudaMemcpyHostToDevice, cuda_upload_stream_for(1)), "host tier up")) return 0;
+        if (!cuda_ok(cudaMemcpyAsync(dd, s.pd, (size_t)d, cudaMemcpyHostToDevice, cuda_upload_stream_for(2)), "host tier down")) return 0;
         return 1;
     }
     if (!cuda_ok(cudaMemcpy(dg, s.pg, (size_t)g, cudaMemcpyHostToDevice), "host tier gate")) return 0;
@@ -29111,6 +29447,7 @@ static int cuda_stream_selected_cache_begin_load(
         if (++g_stall_sync_n % 12200u == 0u) cuda_stall_report();
         if (!sync_ok) return 0;
     }
+    const double t_begin = cuda_now_ms();
     cuda_spec_reap(0);
     if (slot_count != 6u) g_slot_table_rebuild = 1;
     if (slot_count == 6u && cuda_decode_ahead_early()) cuda_spec_issue(table, selected_ids, slot_count);
@@ -29297,6 +29634,7 @@ static int cuda_stream_selected_cache_begin_load(
         cuda_stream_upload_batch uploads;
         double t_vic = 0.0;
         std::vector<uint32_t> filled;
+        const double t_ld0 = cuda_now_ms();
         /* Batched expert reads: collect misses that need file reads and issue them together,
          * so the array sees a deep queue instead of three components at a time. */
         const uint32_t batch_max = cuda_batch_expert_reads();
@@ -29405,6 +29743,7 @@ static int cuda_stream_selected_cache_begin_load(
         }
         if (!flush_pend()) return 0;
         g_ph_victim_ms += t_vic;
+        const double t_ld = cuda_now_ms() - t_ld0;
         const double t_up0 = cuda_now_ms();
         bool async_wait = false;
         if (cuda_async_upload_wait() && uploads.active && g_stream_selected_upload_stream) {
@@ -29421,7 +29760,9 @@ static int cuda_stream_selected_cache_begin_load(
             }
         }
         if (!async_wait && !uploads.finish()) return 0;
-        g_ph_upload_ms += cuda_now_ms() - t_up0;
+        const double t_up = cuda_now_ms() - t_up0;
+        g_ph_upload_ms += t_up;
+        if (slot_count == 6u) { g_pd_load_ms += t_ld; g_pd_upload_ms += t_up; g_pd_misses += (uint64_t)filled.size(); }
         if (slot_count > 6u && cuda_prefill_cold())
             for (uint32_t v : filled) if (v < g_stream_expert_slots.size()) g_stream_expert_slots[v].used = 2;
         g_stream_prefill_ids = remap;
@@ -29430,7 +29771,22 @@ static int cuda_stream_selected_cache_begin_load(
         {
             const double t_rm0 = cuda_now_ms();
             int rm_ok;
-            if (async_wait) {
+            if (g_remap_via_upload_stream && g_stream_selected_upload_stream) {
+                const uint64_t need = (uint64_t)slot_count * sizeof(int32_t);
+                if (g_remap_pinned_cap < need) {
+                    if (g_remap_pinned) (void)cudaFreeHost(g_remap_pinned);
+                    g_remap_pinned = NULL; g_remap_pinned_cap = 0;
+                    void *mem = NULL;
+                    if (cudaHostAlloc(&mem, (size_t)need, cudaHostAllocDefault) == cudaSuccess) { g_remap_pinned = (int32_t *)mem; g_remap_pinned_cap = need; }
+                    else (void)cudaGetLastError();
+                }
+                if (!g_remap_pinned) return 0;
+                memcpy(g_remap_pinned, remap.data(), (size_t)need);
+                rm_ok = cuda_ok(cudaMemcpyAsync(cache.slot_selected_ptr, g_remap_pinned, (size_t)need,
+                                                cudaMemcpyHostToDevice, g_stream_selected_upload_stream),
+                                "gated remap copy") &&
+                        cuda_ok(cudaStreamSynchronize(g_stream_selected_upload_stream), "gated remap sync");
+            } else if (async_wait) {
                 const uint64_t need = (uint64_t)slot_count * sizeof(int32_t);
                 if (g_remap_pinned_cap < need) {
                     if (g_remap_pinned) (void)cudaFreeHost(g_remap_pinned);
@@ -29489,6 +29845,7 @@ static int cuda_stream_selected_cache_begin_load(
             g_spec_upload_pending = 0;
         }
         if (slot_count == 6u && !cuda_decode_ahead_early()) cuda_spec_issue(NULL, NULL, 0);
+        if (slot_count == 6u) { g_pd_layers++; g_pd_begin_ms += cuda_now_ms() - t_begin; if (g_pd_layers % 20000u == 0u) cuda_decode_partition_report(); }
         return 1;
     } catch (...) {
         cuda_stream_selected_cache_release();
@@ -35173,6 +35530,40 @@ extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
             return cuda_stream_selected_cache_begin_load(table, g_flag_ids_host, n_selected);
         }
     }
+    /* DS4_CUDA_SIDE_READBACK=1: pinned asynchronous copy on a side stream ordered
+     * after the work queued so far, then an event wait, instead of a pageable
+     * synchronous cudaMemcpy on the legacy stream. */
+    static int side_rb = -1;
+    if (side_rb < 0) { const char *e = getenv("DS4_CUDA_SIDE_READBACK"); side_rb = e && strcmp(e, "0") != 0; }
+    static cudaStream_t side_stream = NULL; static cudaEvent_t side_ev_r = NULL, side_ev_d = NULL;
+    static int32_t *side_pinned = NULL; static uint32_t side_cap = 0;
+    if (side_rb && n_selected <= 4096u) {
+        if (!side_stream && cudaStreamCreateWithFlags(&side_stream, cudaStreamNonBlocking) != cudaSuccess) { (void)cudaGetLastError(); side_stream = NULL; }
+        if (side_stream && !side_ev_r && (cudaEventCreateWithFlags(&side_ev_r, cudaEventDisableTiming) != cudaSuccess ||
+                                          cudaEventCreateWithFlags(&side_ev_d, cudaEventDisableTiming) != cudaSuccess)) { (void)cudaGetLastError(); side_ev_r = side_ev_d = NULL; }
+        if (side_stream && side_ev_r && side_cap < n_selected) {
+            if (side_pinned) (void)cudaFreeHost(side_pinned);
+            void *mem = NULL;
+            if (cudaHostAlloc(&mem, (size_t)n_selected * sizeof(int32_t), cudaHostAllocDefault) == cudaSuccess) { side_pinned = (int32_t *)mem; side_cap = n_selected; }
+            else { (void)cudaGetLastError(); side_pinned = NULL; side_cap = 0; }
+        }
+        if (side_stream && side_ev_r && side_pinned) {
+            const double t_rb0 = cuda_now_ms();
+            const int ok = cuda_ok(cudaEventRecord(side_ev_r, cuda_decode_stream()), "side readback mark") &&
+                           cuda_ok(cudaStreamWaitEvent(side_stream, side_ev_r, 0), "side readback wait") &&
+                           cuda_ok(cudaMemcpyAsync(side_pinned, selected->ptr, (size_t)n_selected * sizeof(int32_t),
+                                                   cudaMemcpyDeviceToHost, side_stream), "side readback copy") &&
+                           cuda_ok(cudaEventRecord(side_ev_d, side_stream), "side readback done") &&
+                           cuda_ok(cudaEventSynchronize(side_ev_d), "side readback sync");
+            const double rb_dt = cuda_now_ms() - t_rb0;
+            g_stall_readback_ms += rb_dt;
+            g_stall_readback_n++;
+            if (n_selected == 6u) g_pd_readback_ms += rb_dt;
+            if (!ok) return 0;
+            cuda_spec_on_readback(table, side_pinned, n_selected);
+            return cuda_stream_selected_cache_begin_load(table, side_pinned, n_selected);
+        }
+    }
     std::vector<int32_t> ids;
     try {
         ids.resize(n_selected);
@@ -35185,8 +35576,10 @@ extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
                                              (size_t)n_selected * sizeof(int32_t),
                                              cudaMemcpyDeviceToHost),
                                   "GLM streaming selected-id read");
-        g_stall_readback_ms += cuda_now_ms() - t_rb0;
+        const double rb_dt = cuda_now_ms() - t_rb0;
+        g_stall_readback_ms += rb_dt;
         g_stall_readback_n++;
+        if (n_selected == 6u) g_pd_readback_ms += rb_dt;
         if (!rb_ok) return 0;
     }
     cuda_spec_on_readback(table, ids.data(), n_selected);

@@ -41208,6 +41208,8 @@ static bool ds41_decode_island(ds41_gpu_graph *g, const ds4_model *m,
         const bool ok = island == 0 ?
             ds41_graph_before_attention(g, m, l, il) && ds41_attention_project(g, m, l) :
             island == 2 ? ds41_attention_output(g, m, l) :
+            island == 3 ? ds41_moe_finish(g, il) && ds41_graph_after_moe(g) :
+            island == 4 ? ds41_graph_after_attention(g, m, l) :
             ds41_graph_after_attention(g, m, l) && ds41_moe_partial(g, m, l, il, 0);
         if (state != 0) return ok;
         if (!ok) ds4_gpu_decode_graph_abort(&key);
@@ -41218,6 +41220,22 @@ static bool ds41_decode_island(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_decode_layer(ds41_gpu_graph *g, const ds4_model *m,
                                     const ds4_layer_weights *l, uint32_t il, int token) {
+    /* DS4_CUDA_STREAM_ISLANDS=1: single-GPU SSD streaming captures the layer's
+     * position-independent kernel runs as CUDA graphs (layer top + QKV projection,
+     * attention output, after-attention mixes, MoE tail) and keeps positional
+     * attention and the routed MoE (host readback + loads) eager. Same kernels, same
+     * order, so the output is unchanged; only launch gaps disappear. */
+    static int stream_islands = -1;
+    if (stream_islands < 0) { const char *e = getenv("DS4_CUDA_STREAM_ISLANDS"); stream_islands = e && strcmp(e, "0") != 0; }
+    if (stream_islands && g->tp_world == 1 && g->streaming && !g->quality && !g->imatrix &&
+        !g->image_count && !g_expert_profile.active && !getenv("DS4_CUDA_MOE_PROFILE") &&
+        !metal_graph_debug_get_config()->prefix && ds4_gpu_decode_graphs_supported()) {
+        return ds41_decode_island(g, m, l, il, 0) &&
+            ds41_attention(g, m, l, il, true) && ds41_decode_island(g, m, l, il, 2) &&
+            ds41_decode_island(g, m, l, il, 4) &&
+            ds41_moe_partial(g, m, l, il, (uint32_t)token) &&
+            ds41_decode_island(g, m, l, il, 3);
+    }
     if (g->tp_world != 2 || g->streaming || g->quality || g->imatrix ||
         g->image_count || getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER") ||
         g_expert_profile.active || getenv("DS4_CUDA_MOE_PROFILE") ||
