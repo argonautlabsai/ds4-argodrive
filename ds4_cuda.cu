@@ -29668,7 +29668,21 @@ static int cuda_stream_selected_cache_begin_load(
             pend.clear();
             return 1;
         };
-        for (size_t i = 0; i < unique.size(); i++) {
+        /* DS4_CUDA_POOL_FIRST=1: visit pool-resident misses before NVMe misses so their
+         * host-to-device copies run under the reads that follow, not after them. */
+        static int pool_first = -1;
+        if (pool_first < 0) { const char *e = getenv("DS4_CUDA_POOL_FIRST"); pool_first = e && strcmp(e, "0") != 0; }
+        std::vector<size_t> order(unique.size());
+        for (size_t i = 0; i < unique.size(); i++) order[i] = i;
+        if (pool_first && g_host_tier_state == 1) {
+            std::stable_partition(order.begin(), order.end(), [&](size_t i) {
+                if (slots[i] >= 0) return true;
+                const uint64_t g = table->gate_offset + (uint64_t)(uint32_t)unique[i] * table->gate_expert_bytes;
+                return g_host_tier_by_gate.count(g) != 0;
+            });
+        }
+        for (size_t oi = 0; oi < order.size(); oi++) {
+            const size_t i = order[oi];
             if (slots[i] >= 0) continue;
             g_ph_misses++;
             const double t_v0 = cuda_now_ms();
