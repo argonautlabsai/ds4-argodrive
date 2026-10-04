@@ -1,5 +1,43 @@
 # V4.1 stack profile
 
+## 4 October candidate: `v41-stack-20261004` (prefill)
+
+`v41-stack-20261004` is `v41-stack-20260930` plus exactly:
+
+```sh
+DS4_ARGODRIVE_PREFILL_READER=1
+DS4_ARGODRIVE_ENGRAM_PREFETCH_MIN=1
+DS4_ARGODRIVE_ENGRAM_BATCH_READERS=128
+DS4_ARGODRIVE_COOC=<repo>/argodrive/reproduce/hotlists/v41-flash-q4-cooc-20261004.bin
+```
+
+Continuous prefill reader, Engram row tables read on upstream's prefetch thread from the first layer, and a conditional
+read-ahead prior: the [4 October package](../candidates/2026-10-04-engram/README.md) records
+68.85 -> 73.27 prompt tokens/s at pp512/tg512 (+6.4%, BAAB) and
+68.67 -> 73.16 at pp512/tg200 (+6.5%, ABBA) against the 30 September tag build,
+both sides at a 3,600-expert cache (the 4,600 cache tripped the swap guard on the un-rebooted machine), with
+byte-identical output. Select the profile explicitly and pass the hotlist and prior paths for your checkout.
+
+
+## 4 October candidate: `v41-stack-20261004` (prefill)
+
+`v41-stack-20261004` is `v41-stack-20260930` plus exactly:
+
+```sh
+DS4_ARGODRIVE_PREFILL_READER=1
+DS4_ARGODRIVE_ENGRAM_PREFETCH_MIN=1
+DS4_ARGODRIVE_ENGRAM_BATCH_READERS=128
+DS4_ARGODRIVE_COOC=<repo>/argodrive/reproduce/hotlists/v41-flash-q4-cooc-20261004.bin
+```
+
+Continuous prefill reader, Engram row tables read on upstream's prefetch thread from the first layer, and a conditional
+read-ahead prior: the [4 October package](../candidates/2026-10-04-engram/README.md) records
+68.85 -> 73.27 prompt tokens/s at pp512/tg512 (+6.4%, BAAB) and
+68.67 -> 73.16 at pp512/tg200 (+6.5%, ABBA) against the 30 September tag build,
+both sides at a 3,600-expert cache (the 4,600 cache tripped the swap guard on the un-rebooted machine), with
+byte-identical output. Select the profile explicitly and pass the hotlist and prior paths for your checkout.
+
+
 ## 30 September candidate: `v41-stack-20260930` (prefill)
 
 `v41-stack-20260930` is `v41-stack-20260928` plus exactly:

@@ -39222,6 +39222,8 @@ typedef struct {
     ds41_prefill_row carry;
     ds4_gpu_tensor *prefill_tokens;
     const ds4_weights *step_weights;   /* set per decode step; the lookahead probe needs layer il+1 */
+    uint32_t ar_split_previous;        /* Argodrive split-router second half: raw keys of the first half are already in raw_prefill[0..n) */
+    uint32_t ar_split_total;           /* Argodrive split-router: rows of the whole chunk (0 = not split); kernel choice and n_comp follow the whole chunk */
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
@@ -40345,7 +40347,7 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_layer_weights *l, uint32_t il, uint32_t count) {
     const uint32_t start = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
-    const uint32_t n_comp = (start + count) / ratio;
+    const uint32_t n_comp = (g->ar_split_total ? start - g->ar_split_previous + g->ar_split_total : start + count) / ratio; /* Argodrive split-router: whole-chunk count */
     ds41_prefill_row *b = &g->batch;
     if (!n_comp) return true;
     if (getenv("DS4_METAL_DISABLE_V41_BATCH_INDEX_PROJ")) {
@@ -40411,8 +40413,14 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l, uint32_t il, uint32_t count) {
     const uint32_t start = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
-    const uint32_t n_comp = ratio ? (start + count) / ratio : 0;
-    const uint32_t previous = start < 127u ? start : 127u;
+    /* Argodrive split-router: both halves see the whole chunk's compressed-key count, so the kernel
+     * choice (indexed vs. mixed at the top-k threshold) and every masked-key loop match the unsplit pass. */
+    const uint32_t chunk_end = g->ar_split_total ? start - g->ar_split_previous + g->ar_split_total : start + count;
+    const uint32_t n_comp = ratio ? chunk_end / ratio : 0;
+    /* Argodrive split-router: the second token half keeps the first half's raw keys in place, so
+     * every kernel sees the same key array at the same alignment as the unsplit pass. */
+    const uint32_t split_prev = g->ar_split_previous;
+    const uint32_t previous = split_prev ? split_prev : (start < 127u ? start : 127u);
     const uint32_t raw_start = (start - previous) % 128u;
     const uint32_t first = previous < 128u - raw_start ? previous : 128u - raw_start;
     const uint32_t n_raw = previous + count;
@@ -40425,9 +40433,9 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
         !ds4_gpu_dsv41_rope(b->kv, DS4_N_HEAD_DIM, 1, count, start, ratio != 0, false) ||
         !ds4_gpu_dsv41_quantize(b->kv, DS4_N_HEAD_DIM, count, DS4_V41_FP8_E8M0)) return false;
     /* Preserve chronological raw keys before publishing the final decode ring. */
-    if (first && !ds4_gpu_tensor_copy(g->raw_prefill, 0, g->window[il],
+    if (!split_prev && first && !ds4_gpu_tensor_copy(g->raw_prefill, 0, g->window[il],
                                      raw_start * row_bytes, first * row_bytes)) return false;
-    if (previous > first && !ds4_gpu_tensor_copy(g->raw_prefill, first * row_bytes,
+    if (!split_prev && previous > first && !ds4_gpu_tensor_copy(g->raw_prefill, first * row_bytes,
             g->window[il], 0, (previous - first) * row_bytes)) return false;
     if (!ds4_gpu_tensor_copy(g->raw_prefill, previous * row_bytes, b->kv, 0, count * row_bytes))
         return false;
@@ -40454,7 +40462,7 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
         const uint64_t q_row = (uint64_t)heads * DS4_N_HEAD_DIM * sizeof(float);
         for (uint32_t off = 0; ok && off < count; off += 2048u) {
             const uint32_t rows = count - off < 2048u ? count - off : 2048u;
-            const uint32_t past = start + off < 127u ? start + off : 127u;
+            const uint32_t past = split_prev ? split_prev + off : (start + off < 127u ? start + off : 127u);
             const uint32_t raw_offset = previous + off - past;
             ds4_gpu_tensor *q = ds4_gpu_tensor_view(b->q, off * q_row, rows * q_row);
             ds4_gpu_tensor *out = ds4_gpu_tensor_view(b->heads, off * q_row, rows * q_row);
@@ -40581,6 +40589,11 @@ static FILE *ar_prefill_ids_dump(void) {
  * "layer n id:count ..." produced from prefill selection dumps of other prompts; the
  * loader ranks each layer's experts by count. Nothing else changes: the ids the
  * router selects are still all staged before the routed MoE runs. */
+static int ar_prefill_trace_on(void) {
+    static int checked, on;
+    if (!checked) { const char *e = getenv("DS4_ARGODRIVE_PREFILL_TRACE"); on = e && strcmp(e, "0") != 0; checked = 1; }
+    return on;
+}
 static uint32_t ar_prefill_hot_k(void) {
     static int checked; static uint32_t k;
     if (!checked) {
@@ -40647,6 +40660,61 @@ static int ar_hotlist_load(void) {
     fprintf(stderr, "ds4: Argodrive prefill hotlist %s: %u of %u layers ranked%s\n", path, layers_seen, n_layer, ok ? "" : " (disabled)");
     return ok;
 }
+/* Argodrive 2026-10-04 (ARGODRIVE_COOC): conditional read-ahead prior. DS4_ARGODRIVE_COOC=path loads an
+ * "ARCOOC01" table (40 layers, 384 experts: uint16 counts of (e at L, e' at L+1) over a corpus of other
+ * prompts, then uint32 per-layer marginals). With it, the next layer's read-ahead order is
+ * score[e'] = sum_e hits_L[e] * C[L][e][e'], the marginal breaking ties, where hits_L are this prompt's
+ * routed counts at the layer just staged; the hotlist stays the fallback (layer 0, missing table). Read
+ * order only: routing, weights, arithmetic and output are unchanged. */
+static uint16_t *ar_cooc_c; static uint32_t *ar_cooc_m; static int ar_cooc_state;
+static int ar_cooc_load(void) {
+    if (ar_cooc_state) return ar_cooc_state > 0;
+    ar_cooc_state = -1;
+    const char *path = getenv("DS4_ARGODRIVE_COOC");
+    if (!path || !*path) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "ds4: Argodrive cooc prior %s: %s\n", path, strerror(errno)); return 0; }
+    char magic[8]; uint32_t nl = 0, ne = 0;
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "ARCOOC01", 8) != 0 || fread(&nl, 4, 1, f) != 1 ||
+        fread(&ne, 4, 1, f) != 1 || nl != DS4_N_LAYER || ne != DS4_N_EXPERT || ne > DS4_MAX_EXPERT) {
+        fprintf(stderr, "ds4: Argodrive cooc prior %s: header does not match this model\n", path); fclose(f); return 0;
+    }
+    const size_t nc = (size_t)(nl - 1u) * ne * ne, nm = (size_t)nl * ne;
+    ar_cooc_c = malloc(nc * sizeof(uint16_t)); ar_cooc_m = malloc(nm * sizeof(uint32_t));
+    if (!ar_cooc_c || !ar_cooc_m || fread(ar_cooc_c, sizeof(uint16_t), nc, f) != nc || fread(ar_cooc_m, sizeof(uint32_t), nm, f) != nm) {
+        fprintf(stderr, "ds4: Argodrive cooc prior %s: short read\n", path);
+        free(ar_cooc_c); free(ar_cooc_m); ar_cooc_c = NULL; ar_cooc_m = NULL; fclose(f); return 0;
+    }
+    fclose(f); ar_cooc_state = 1;
+    fprintf(stderr, "ds4: Argodrive cooc prior %s: %u layers, %u experts\n", path, nl, ne);
+    return 1;
+}
+static uint32_t ar_cur_hits[DS4_MAX_EXPERT]; static uint32_t ar_cur_il = UINT32_MAX;
+static int32_t ar_cooc_rank[2][DS4_MAX_EXPERT]; static unsigned ar_cooc_rank_sel;
+static uint64_t ar_cooc_score[DS4_MAX_EXPERT];
+static int ar_cooc_cmp(const void *a, const void *b) {
+    const int32_t x = *(const int32_t *)a, y = *(const int32_t *)b;
+    if (ar_cooc_score[x] != ar_cooc_score[y]) return ar_cooc_score[x] > ar_cooc_score[y] ? -1 : 1;
+    return x < y ? -1 : x > y;
+}
+static const int32_t *ar_cooc_ranked(uint32_t next_il, uint32_t *n_out) {
+    if (!ar_cooc_load() || next_il == 0 || next_il >= DS4_N_LAYER || ar_cur_il != next_il - 1u) return NULL;
+    const uint32_t L = next_il - 1u, ne = DS4_N_EXPERT;
+    for (uint32_t e2 = 0; e2 < ne; e2++) ar_cooc_score[e2] = 0;
+    for (uint32_t e = 0; e < ne; e++) {
+        const uint64_t h = ar_cur_hits[e];
+        if (!h) continue;
+        const uint16_t *row = ar_cooc_c + ((size_t)L * ne + e) * ne;
+        for (uint32_t e2 = 0; e2 < ne; e2++) ar_cooc_score[e2] += h * row[e2];
+    }
+    /* marginal of the next layer as the tie-breaker (bounded by 2^20 in any sane corpus) */
+    for (uint32_t e2 = 0; e2 < ne; e2++) ar_cooc_score[e2] = (ar_cooc_score[e2] << 21) | (ar_cooc_m[(size_t)next_il * ne + e2] & 0x1fffffu);
+    int32_t *out = ar_cooc_rank[ar_cooc_rank_sel ^= 1u];
+    for (uint32_t e2 = 0; e2 < ne; e2++) out[e2] = (int32_t)e2;
+    qsort(out, ne, sizeof(int32_t), ar_cooc_cmp);
+    *n_out = ne;
+    return out;
+}
 static void ar_prefill_prestage_next(const ds4_model *m, const ds4_layer_weights *next_l, uint32_t next_il) {
     const uint32_t k = ar_prefill_hot_k();
     if (!k || !next_l || !next_l->ffn_gate_exps || !next_l->ffn_up_exps || !next_l->ffn_down_exps) return;
@@ -40657,8 +40725,12 @@ static void ar_prefill_prestage_next(const ds4_model *m, const ds4_layer_weights
                                   next_l->ffn_down_exps->abs_offset };
     const uint64_t sizes[3] = { next_l->ffn_gate_exps->bytes, next_l->ffn_up_exps->bytes, next_l->ffn_down_exps->bytes };
     uint32_t n = ar_hot_n[next_il]; if (n > k) n = k;
+    const int32_t *ranked = &ar_hot_ids[(size_t)next_il * DS4_N_EXPERT];
+    uint32_t n_cooc = 0;
+    const int32_t *cooc = ar_cooc_ranked(next_il, &n_cooc);
+    if (cooc) { ranked = cooc; n = n_cooc < k ? n_cooc : k; }
     (void)ar_prefill_prestage_start(m->map, m->size, offsets, sizes, gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD,
-                                    &ar_hot_ids[(size_t)next_il * DS4_N_EXPERT], n);
+                                    ranked, n);
 }
 /* Argodrive 2026-09-30 (ARGODRIVE_PREFILL_WAVES): DS4_ARGODRIVE_PREFILL_WAVES=1 runs the
  * routed MoE in two waves when the read-ahead landed part of a layer: wave 1 covers the
@@ -40690,8 +40762,8 @@ static bool ds41_stage_selected_for_layer(ds41_gpu_graph *g, const ds4_model *m,
     /* DS4_ARGODRIVE_PREFILL_TRACE=1: per-layer CPU timeline. since_publish = previous
      * layer's publish to this drain start (encode + GPU + everything else), drain = wait
      * for the router ids, stage = staging/top-up until publish. */
-    static int trace_checked, trace_on; static double trace_last_publish;
-    if (!trace_checked) { const char *e = getenv("DS4_ARGODRIVE_PREFILL_TRACE"); trace_on = e && strcmp(e, "0") != 0; trace_checked = 1; }
+    static double trace_last_publish;
+    const int trace_on = ar_prefill_trace_on();
     const double t_drain0 = trace_on ? now_sec() : 0;
     const int had_batch = ds4_gpu_commands_active() != 0;
     if (had_batch && !ds4_gpu_end_commands()) return false;
@@ -40714,12 +40786,25 @@ static bool ds41_stage_selected_for_layer(ds41_gpu_graph *g, const ds4_model *m,
         }
         if (ok) {
             for (uint32_t i = 0; i < DS4_N_EXPERT; i++) if (seen[i]) ids[n_ids++] = (int32_t)i;
+            memcpy(ar_cur_hits, hits, sizeof(ar_cur_hits)); ar_cur_il = il; /* ARGODRIVE_COOC: this layer's counts rank the next */
             FILE *dump = ar_prefill_ids_dump();
             if (dump) {
                 fprintf(dump, "%u %u", il, n_ids);
                 for (uint32_t i = 0; i < n_ids; i++) fprintf(dump, " %d:%u", ids[i], hits[ids[i]]);
                 fputc('\n', dump); fflush(dump);
             }
+            /* Argodrive 2026-10-04 diagnostic (DS4_ARGODRIVE_PREFILL_TOKENS_DUMP=path): every token's six
+             * routed ids per layer, "il t id0..id5", for building conditional read-ahead priors offline. */
+            { static FILE *tdump; static int tchecked;
+              if (!tchecked) { tchecked = 1; const char *tp = getenv("DS4_ARGODRIVE_PREFILL_TOKENS_DUMP"); if (tp && *tp) tdump = fopen(tp, "w"); }
+              if (tdump) {
+                  for (uint32_t t = 0; t < count; t++) {
+                      fprintf(tdump, "%u %u", il, t);
+                      for (uint32_t j = 0; j < DS4_N_EXPERT_USED; j++) fprintf(tdump, " %d", selected[t * DS4_N_EXPERT_USED + j]);
+                      fputc('\n', tdump);
+                  }
+                  fflush(tdump);
+              } }
             const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
             const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
             const uint64_t offsets[3] = { l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
@@ -40790,9 +40875,121 @@ static bool ds41_stage_selected_for_layer(ds41_gpu_graph *g, const ds4_model *m,
 }
 #endif
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* Argodrive 2026-10-04 (ARGODRIVE_PREFILL_SPLIT_ROUTER): the selective staging of a layer cannot
+ * start before its router has run over all prompt tokens, so the drives spend the whole attention
+ * on ranked guesses (71% useful on this prompt). With DS4_ARGODRIVE_PREFILL_SPLIT_ROUTER=1 the
+ * attention, HC mixing and router run in two token halves: the first half's ids are read back as
+ * soon as its router has run and handed to the reader lanes as certain work while the GPU runs the
+ * second half. Every kernel is the same kernel over the same rows (row views of the same batch
+ * buffers, positions carried by the half's start); only the order of encoding and of reads changes. */
+static int ar_split_router_enabled(void) {
+    static int checked, on;
+    if (!checked) { const char *e = getenv("DS4_ARGODRIVE_PREFILL_SPLIT_ROUTER"); on = e && *e && strcmp(e, "0") != 0; checked = 1; }
+    return on;
+}
+/* DS4_ARGODRIVE_PREFILL_SPLIT_LAYERS=lo-hi restricts the split to layers lo..hi (bisection aid; default all). */
+static int ar_split_router_layer(uint32_t il) {
+    static int checked; static long lo = 0, hi = 1000;
+    if (!checked) { const char *e = getenv("DS4_ARGODRIVE_PREFILL_SPLIT_LAYERS"); if (e && *e) { char *end = NULL; lo = strtol(e, &end, 10); hi = (end && *end == '-') ? strtol(end + 1, NULL, 10) : lo; } checked = 1; }
+    return (long)il >= lo && (long)il <= hi;
+}
+static ds41_gpu_graph ar_split_half[2];
+static int ar_split_half_live[2];
+static void ds41_prefill_split_free(void) {
+    for (unsigned h = 0; h < 2; h++) {
+        if (!ar_split_half_live[h]) continue;
+        ds41_gpu_graph *half = &ar_split_half[h];
+#define DS41_HALF_FREE(name, width) if (half->batch.name) { ds4_gpu_tensor_free(half->batch.name); half->batch.name = NULL; }
+        DS41_PREFILL_ROWS(DS41_HALF_FREE)
+#undef DS41_HALF_FREE
+        if (half->prefill_tokens) { ds4_gpu_tensor_free(half->prefill_tokens); half->prefill_tokens = NULL; }
+        ar_split_half_live[h] = 0;
+    }
+}
+static bool ds41_prefill_half_views(const ds41_gpu_graph *g, unsigned h, uint32_t off_rows, uint32_t n_rows, uint32_t total_rows) {
+    ds41_gpu_graph *half = &ar_split_half[h];
+    *half = *g;
+    half->pos = g->pos + off_rows;
+    half->rows_view = g->rows_view + off_rows;
+    half->ar_split_previous = off_rows; /* 0 for the first half: the normal ring reconstruction */
+    half->ar_split_total = total_rows;
+    ar_split_half_live[h] = 1;
+    bool ok = true;
+#define DS41_HALF_VIEW(name, width) \
+    half->batch.name = ok ? ds4_gpu_tensor_view(g->batch.name, (uint64_t)off_rows * (width) * sizeof(float), \
+                                                (uint64_t)n_rows * (width) * sizeof(float)) : NULL; \
+    if (!half->batch.name) ok = false;
+    DS41_PREFILL_ROWS(DS41_HALF_VIEW)
+#undef DS41_HALF_VIEW
+    half->prefill_tokens = ok ? ds4_gpu_tensor_view(g->prefill_tokens, (uint64_t)off_rows * sizeof(int32_t),
+                                                    (uint64_t)n_rows * sizeof(int32_t)) : NULL;
+    if (!half->prefill_tokens) ok = false;
+    return ok;
+}
+static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t count);
+static bool ds41_prefill_split_pass(ds41_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                    uint32_t il, uint32_t count, int trace) {
+    const uint32_t n0 = (count / 2u) & ~1u; /* even split keeps the 2:1 KV pooling aligned */
+    const uint32_t offs[2] = { 0, n0 }, ns[2] = { n0, count - n0 };
+    ds41_prefill_split_free();
+    for (unsigned h = 0; h < 2; h++) {
+        if (!ds41_prefill_half_views(g, h, offs[h], ns[h], count)) return false;
+        ds41_gpu_graph *half = &ar_split_half[h];
+        const uint32_t n = ns[h];
+        bool ok = ds41_before_attention_batch(half, &half->batch, m, l, il, n) &&
+                  ds41_attention_project_batch(half, m, l, n) &&
+                  ds41_attention_batch(half, m, l, il, n);
+        if (ok) {
+            if (l->attn_output_b->type == DS4_TENSOR_Q8_0) {
+                ok = ds4_gpu_dsv41_attention_output_batch(half->batch.block, half->batch.low,
+                        m->map, m->size, l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
+                        half->batch.heads, n) &&
+                     ds4_gpu_dsv41_quantize(half->batch.block, DS4_N_EMBD, n, DS4_V41_BF16);
+            } else {
+                ds41_gpu_graph row = *half;
+                for (uint32_t t = 0; ok && t < n; t++) {
+                    row.heads = half->rows_view[t].heads;
+                    row.low = half->rows_view[t].low;
+                    ok = ds41_attention_low(&row, m, l);
+                }
+                if (ok) ok = ds41_matmul_batch(half->batch.block, m, l->attn_output_b, half->batch.low, n, true);
+            }
+        }
+        if (ok) ok = ds41_after_attention_batch(&half->batch, m, l, n);
+        if (ok) ok = ds41_matmul_batch(half->batch.route_logits, m, l->ffn_gate_inp, half->batch.norm, n, false) &&
+                     ds41_route_batch(half, m, l, n);
+        if (ok && h == 0) {
+            /* First half's ids: drain, read, hand to the lanes, reopen the batch. */
+            const double t0 = trace ? now_sec() : 0;
+            if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+            const int32_t *sel = ok ? ds4_gpu_tensor_contents(half->batch.selected) : NULL;
+            if (!sel) ok = false;
+            if (ok) {
+                static uint8_t seen[DS4_MAX_EXPERT];
+                static int32_t ids[DS4_MAX_EXPERT];
+                memset(seen, 0, sizeof(seen));
+                uint32_t n_ids = 0;
+                for (uint32_t t = 0; t < n; t++)
+                    for (uint32_t j = 0; j < DS4_N_EXPERT_USED; j++) {
+                        const int32_t id = sel[t * DS4_N_EXPERT_USED + j];
+                        if (id >= 0 && (uint32_t)id < DS4_N_EXPERT && !seen[id]) { seen[id] = 1; ids[n_ids++] = id; }
+                    }
+                const uint32_t queued = ar_prefill_stage_ids_hint(ids, n_ids);
+                if (trace) fprintf(stderr, "ds4: Argodrive prefill split-router layer=%u rows=%u ids=%u queued=%u drain_ms=%.1f\n",
+                                   il, n, n_ids, queued, (now_sec() - t0) * 1000);
+                ok = ds4_gpu_begin_commands() != 0;
+            }
+        }
+        if (!ok) return false;
+    }
+    return true;
+}
+#endif
+
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, uint32_t count,
-                           bool shared_owner, const ds4_layer_weights *next_l) {
+                           bool shared_owner, const ds4_layer_weights *next_l, bool router_done) {
     ds41_prefill_row *b = &g->batch;
     const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
@@ -40800,7 +40997,8 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
 #if !defined(__APPLE__) || defined(DS4_NO_GPU)
     (void)next_l;
 #endif
-    if (!(ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
+    if (!router_done &&
+        !(ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
           ds41_route_batch(g, m, l, count))) return false;
     int waves = 0;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
@@ -40830,14 +41028,21 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
          * fixed-order slot sum is the one that counts. */
         const uint32_t parts = (uint32_t)waves;
         const ds4_gpu_tensor *wsel[4] = { b->selected_w1, b->selected_w2, b->selected_w3, b->selected_w4 };
+        const int tr = ar_prefill_trace_on();
+        const double t_w1_0 = tr ? now_sec() : 0;
         if (!DS41_ROUTED_BATCH(wsel[0])) return false;
         if (!ds4_gpu_flush_commands()) return false;
+        const double t_w1_1 = tr ? now_sec() : 0;
+        double t_topup = 0, t_w2 = 0;
         for (uint32_t p = 0; p < parts; p++) {
             if (!ar_prefill_stage_ids_finish_part(p, parts)) return false;
-            if (p + 1 == parts) ar_prefill_prestage_next(m, next_l, il + 1);
+            if (p + 1 == parts) { ar_prefill_prestage_next(m, next_l, il + 1); if (tr) t_topup = now_sec(); }
             if (!DS41_ROUTED_BATCH(wsel[1 + p])) return false;
             if (p + 1 < parts && !ds4_gpu_flush_commands()) return false;
         }
+        if (tr) { t_w2 = now_sec();
+            fprintf(stderr, "ds4: Argodrive prefill waves layer=%u wave1_encode_flush_ms=%.1f topup_ms=%.1f wave2_encode_ms=%.1f\n",
+                    il, (t_w1_1 - t_w1_0) * 1000, (t_topup - t_w1_1) * 1000, (t_w2 - t_topup) * 1000); }
     } else
 #endif
     if (!DS41_ROUTED_BATCH(b->selected)) return false;
@@ -41422,7 +41627,19 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
      * decode cache from it before advancing to the next layer. */
     row.streaming = false;
     ds41_engram_prefetch engram_prefetch = {0};
-    const bool overlap_engram = total_count >= 1024u &&
+    /* Argodrive 2026-10-04 (ARGODRIVE_ENGRAM_PREFETCH_MIN): upstream overlaps the two Engram
+     * row-table reads with the sweep only from 1,024 prompt tokens; below that they run on
+     * the sweep thread at layers 1 and 14. With the selective read-ahead the drives are
+     * saturated by expert staging at that moment, and the 12,288 random 264-byte reads per
+     * table stretch from ~80 ms to ~0.5 s each. DS4_ARGODRIVE_ENGRAM_PREFETCH_MIN=<tokens>
+     * lowers the threshold (default 1024 = upstream); same rows, same bytes, same output. */
+    static long ar_engram_prefetch_min = -1;
+    if (ar_engram_prefetch_min < 0) {
+        const char *ar_epm = getenv("DS4_ARGODRIVE_ENGRAM_PREFETCH_MIN");
+        ar_engram_prefetch_min = ar_epm && *ar_epm ? strtol(ar_epm, NULL, 10) : 1024;
+        if (ar_engram_prefetch_min < 1) ar_engram_prefetch_min = 1;
+    }
+    const bool overlap_engram = total_count >= (uint32_t)ar_engram_prefetch_min &&
         !getenv("DS4_METAL_DISABLE_V41_ENGRAM_PREFETCH") &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_ENGRAM");
     const bool pipeline_engram = overlap_engram &&
@@ -41450,6 +41667,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #endif
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (cancel && cancel(cancel_ud)) { ok = false; break; }
+        const bool cpu_trace = ar_prefill_trace_on();
+        double stage_start = (stage_profile || cpu_trace) ? now_sec() : 0;
         if (encoder_only && il == 20u) {
             /* Publish every encoder key, but leave the decoder invalid until
              * the last sweep rebuilds its exact 2541-token dependency suffix. */
@@ -41469,6 +41688,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 ok = metal_graph_stream_prepare_join_layer(NULL, m, w, il, first_count,
                         false, true, false, false, &prepare, 1);
             if (ok) ok = ar_prefill ? metal_graph_stream_map_layer_decode(m,w,il) : metal_graph_stream_map_layer(m,w,il);
+        if (cpu_trace && ok) { const double now_m = now_sec(); if (il < 4u || now_m - stage_start > 0.05) fprintf(stderr, "ds4: Argodrive cpu stage layer=%u stream map/prepare=%.1f ms\n", il, (now_m - stage_start) * 1000); stage_start = now_m; }
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
             if (ok && ar_prefill && !ar_prefill_selective_for(total_count)) {
                 const ds4_layer_weights *l=&w->layer[il];
@@ -41550,6 +41770,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 if (ok) ok = ds41_carry_copy(g, off, count, false);
             }
             if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+        if (cpu_trace && ok) { const double now_m = now_sec(); if (il < 4u || now_m - stage_start > 0.05) fprintf(stderr, "ds4: Argodrive cpu stage layer=%u loop-top drain=%.1f ms\n", il, (now_m - stage_start) * 1000); stage_start = now_m; }
             const double t_ready = profile ? now_sec() : 0;
             if (ok && ds41_engram_layer(il)) {
                 const uint32_t engram = il == 1 ? 0 : 1;
@@ -41567,8 +41788,12 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 }
             }
             const double t_engram = profile ? now_sec() : 0;
-            double stage_start = stage_profile ? now_sec() : 0;
 #define DS41_STAGE(label) do { \
+                if (ok && !stage_profile && cpu_trace) { /* Argodrive 2026-10-04: CPU-side stage marks, no drain */ \
+                    const double now = now_sec(); \
+                    if (il < 4u || now - stage_start > 0.05) fprintf(stderr, "ds4: Argodrive cpu stage layer=%u %s=%.1f ms\n", il, (label), (now - stage_start) * 1000); \
+                    stage_start = now; \
+                } \
                 if (ok && stage_profile) { \
                     ok = ds4_gpu_end_commands() != 0; \
                     const double now = now_sec(); \
@@ -41584,7 +41809,14 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 ok = ds4_gpu_tensor_copy(g->batch.engram_rows, 0, g->engram_prefetch,
                                          off * bytes, count * bytes) != 0;
             }
-            if (ok && batch_hc)
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            const bool ar_split = ar_prefill && ar_split_router_enabled() && ar_split_router_layer(il) && batch_hc && batch_attention && batch_core &&
+                batch_moe && g->tp_world == 1 && !g->image_count && count >= 64u && !encoder_only && !decoder_suffix &&
+                ar_prefill_selective_for(count) && ar_prefill_waves_enabled() != 0;
+#else
+            const bool ar_split = false;
+#endif
+            if (ok && batch_hc && !ar_split)
                 ok = ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count);
             DS41_STAGE("hc/engram");
             for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
@@ -41596,6 +41828,12 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     batch_moe ? ds41_graph_before_moe(&row, m, &w->layer[il], il) :
                     ds41_graph_layer(&row, m, &w->layer[il], il, tokens[off + t]);
             }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            if (ok && ar_split) {
+                ok = ds41_prefill_split_pass(g, m, &w->layer[il], il, count, cpu_trace);
+                DS41_STAGE("split attention+router");
+            } else
+#endif
             if (ok && batch_attention) {
                 const ds4_layer_weights *l = &w->layer[il];
                 ok = ds41_attention_project_batch(g, m, l, count);
@@ -41644,7 +41882,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             if (ok && batch_moe) {
                 ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false,
-                                    (il + 1 < DS4_N_LAYER) ? &w->layer[il + 1] : NULL);
+                                    (il + 1 < DS4_N_LAYER) ? &w->layer[il + 1] : NULL, ar_split);
                 DS41_STAGE("shared/routed ffn");
                 if (ok && batch_hc) {
                     ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
@@ -41691,6 +41929,9 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 DS41_PREFILL_ROWS(DS41_ACTIVE_FREE)
 #undef DS41_ACTIVE_FREE
             }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            ds41_prefill_split_free(); /* the chunk's commands have drained above */
+#endif
             if (batch_hc && il + 1u == DS4_N_LAYER && off + count == total_count) {
                 row.residual = g->rows_view[count - 1u].residual;
                 row.pre = g->rows_view[count - 1u].ffn_split;
@@ -41811,7 +42052,7 @@ static bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *toke
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds41_after_attention_batch(&active, model, l, rows) &&
-            ds41_moe_batch(g, model, l, il, rows, shared_owner, NULL) &&
+            ds41_moe_batch(g, model, l, il, rows, shared_owner, NULL, false) &&
             (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
                 (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
                 ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&
@@ -42155,6 +42396,22 @@ static void ds4_engine_print_startup_memory(
             mem.comp_cap,
             ds4_backend_name(e->backend),
             reset);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* Argodrive 2026-10-04 (ARGODRIVE_PREFILL_PREWARM): DS4_ARGODRIVE_PREFILL_PREWARM=1 allocates and
+     * touches both prefill staging sets here, at load, instead of inside the first prompt. */
+    {
+        const char *pw = getenv("DS4_ARGODRIVE_PREFILL_PREWARM");
+        if (pw && strcmp(pw, "0") != 0) {
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                const ds4_layer_weights *l = &e->weights.layer[il];
+                if (l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps) {
+                    (void)ds4_gpu_argodrive_prefill_prewarm(l->ffn_gate_exps->bytes, l->ffn_up_exps->bytes, l->ffn_down_exps->bytes);
+                    break;
+                }
+            }
+        }
+    }
+#endif
 }
 
 static bool cpu_directional_steering_enabled(

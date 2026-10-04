@@ -62,11 +62,13 @@ int ar_prefill_stage_ids_begin(const void *map, uint64_t size, const uint64_t of
                                uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
                                const int32_t *ids, uint32_t n_ids, uint8_t *landed);
 int ar_prefill_stage_ids_finish(void);
+int ds4_gpu_argodrive_prefill_prewarm(uint64_t gate_bytes, uint64_t up_bytes, uint64_t down_bytes);
 /* Top-up in contiguous parts (ascending id order): part p of `parts`; the last part
  * closes the stage. Kernels encoded after part p may touch landed experts and the
  * experts of parts 0..p. */
 int ar_prefill_stage_ids_finish_part(uint32_t part, uint32_t parts);
 uint32_t ar_prefill_stage_ids_topup_count(void);
+uint32_t ar_prefill_stage_ids_hint(const int32_t *ids, uint32_t n_ids);
 int ar_prefill_stage_ahead(const void *map, uint64_t size, const uint64_t offsets[3], const uint64_t sizes[3]);
 #endif
 int ds4_gpu_init(void);

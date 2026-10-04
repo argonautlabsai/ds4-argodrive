@@ -15,6 +15,7 @@
 #include <time.h>
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
+#include <pthread.h>
 #endif
 
 /* Opt-in read accounting counts successful syscall bytes, including partial
@@ -266,15 +267,55 @@ static int request_order(const void *a, const void *b) {
     return (x->row > y->row) - (x->row < y->row);
 }
 
-enum { ENGRAM_READERS = 16 };
+enum { ENGRAM_READERS = 16, AR_ENGRAM_BATCH_MAX = 256 };
 
 typedef struct {
     const ds4_engram_table *table;
     const engram_request *request;
     float *out;
     size_t count, readers;
-    int error[ENGRAM_READERS];
+    int error[AR_ENGRAM_BATCH_MAX];
 } engram_batch;
+
+/* Argodrive 2026-10-04 (ARGODRIVE_ENGRAM_BATCH_READERS): the batch path issues its random
+ * 264-byte reads from 16 GCD workers. While the prefill staging keeps the drive queues full
+ * of large expert reads, each small read waits behind them (~1 ms instead of ~0.1 ms), and
+ * 12,288 rows take ~0.9 s instead of ~80 ms. More outstanding reads finish the same rows in
+ * proportionally less wall time. DS4_ARGODRIVE_ENGRAM_BATCH_READERS=<n> (default 16 =
+ * upstream) uses n pthreads above 16. Same rows into the same disjoint slots; output unchanged. */
+static unsigned ar_engram_batch_readers(void) {
+    static long n = -1;
+    if (n < 0) {
+        const char *s = getenv("DS4_ARGODRIVE_ENGRAM_BATCH_READERS");
+        n = s && *s ? strtol(s, NULL, 10) : ENGRAM_READERS;
+        if (n < 1) n = 1;
+        if (n > AR_ENGRAM_BATCH_MAX) n = AR_ENGRAM_BATCH_MAX;
+    }
+    return (unsigned)n;
+}
+
+static void read_batch_part(void *context, size_t part);
+typedef struct { engram_batch *batch; size_t part; } ar_engram_batch_arg;
+static void *ar_engram_batch_thread(void *arg) {
+    const ar_engram_batch_arg *a = arg;
+    read_batch_part(a->batch, a->part);
+    return NULL;
+}
+static void ar_engram_batch_threads(engram_batch *batch) {
+    pthread_t th[AR_ENGRAM_BATCH_MAX];
+    ar_engram_batch_arg args[AR_ENGRAM_BATCH_MAX];
+    unsigned char running[AR_ENGRAM_BATCH_MAX];
+    pthread_attr_t attr;
+    const int has_attr = pthread_attr_init(&attr) == 0;
+    if (has_attr) (void)pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INITIATED, 0);
+    for (size_t i = 0; i < batch->readers; i++) {
+        args[i] = (ar_engram_batch_arg){batch, i};
+        running[i] = pthread_create(&th[i], has_attr ? &attr : NULL, ar_engram_batch_thread, &args[i]) == 0;
+        if (!running[i]) read_batch_part(batch, i); /* out of threads: do this slice inline */
+    }
+    for (size_t i = 0; i < batch->readers; i++) if (running[i]) pthread_join(th[i], NULL);
+    if (has_attr) pthread_attr_destroy(&attr);
+}
 
 static void read_batch_part(void *context, size_t part) {
     engram_batch *batch = context;
@@ -334,8 +375,10 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
         /* Fixed concurrency hides random-read latency without caching the table.
          * Each worker owns disjoint output rows; all finish before GPU use. */
         if (count >= 256) {
-            batch.readers = ENGRAM_READERS;
-            dispatch_apply_f(batch.readers,
+            batch.readers = ar_engram_batch_readers();
+            if (batch.readers > count) batch.readers = count;
+            if (batch.readers > ENGRAM_READERS) ar_engram_batch_threads(&batch);
+            else dispatch_apply_f(batch.readers,
                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &batch, read_batch_part);
         } else
 #endif

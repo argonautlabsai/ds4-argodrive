@@ -21,6 +21,25 @@ DS41_LOCAL_BENCHMARK = {
 
 def ds41_fork_profile(model_path, replica_paths, profile='legacy'):
     """Export a reviewable configuration; this is not engine capability detection."""
+    if profile == 'v41-stack-20261004':
+        # 2026-10-04: the 30 September profile plus (a) the continuous prefill reader (persistent lanes that
+        # carry the read-ahead straight into the top-up instead of one staging thread per layer), and
+        # (b) the Engram row tables read on upstream's prefetch thread from the first layer with 128
+        # readers, so the two 12,288-row table reads no longer stall layers 1 and 14 while the drives are
+        # busy with expert staging. Same rows, same experts, output bit-identical to the 30 September
+        # profile; decode unchanged. Screens: argodrive/candidates/2026-10-04-engram/README.md.
+        # (c) the conditional read-ahead prior: the next layer's experts are ranked by P(expert at L+1 | expert at L),
+        # tabulated from per-token routing of the same 19 prompts, weighted by this prompt's layer-L routing counts
+        # (the hotlist remains the fallback for layer 0). Read order only.
+        previous = ds41_fork_profile(model_path, replica_paths, 'v41-stack-20260930')
+        env = dict(previous['environment'])
+        cooc = Path(__file__).resolve().parents[1] / 'hotlists' / 'v41-flash-q4-cooc-20261004.bin'
+        env.update({'DS4_ARGODRIVE_PREFILL_READER': '1', 'DS4_ARGODRIVE_ENGRAM_PREFETCH_MIN': '1',
+                    'DS4_ARGODRIVE_ENGRAM_BATCH_READERS': '128', 'DS4_ARGODRIVE_COOC': str(cooc)})
+        errors = list(previous['errors'])
+        if not cooc.is_file(): errors.append(f'missing conditional prior {cooc}')
+        return {**previous, 'id': profile, 'status': 'Pinned V4.1 stack candidate (2026-10-04)', 'environment': env, 'errors': errors,
+                'scope': previous['scope'].replace('prefill read-ahead and two-wave routed MoE,', 'prefill read-ahead with a continuous reader and a conditional prior, two-wave routed MoE, early Engram table reads,')}
     if profile == 'v41-stack-20260930':
         # 2026-09-30: the 28 September profile plus prefill read-ahead staging (the next layer's likeliest
         # experts, ranked by a hotlist built from other prompts, are read while the GPU computes the current

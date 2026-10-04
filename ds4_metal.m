@@ -13228,11 +13228,13 @@ static int ar_force_reuse(uint32_t budget, uint32_t entries) {
 }
 static int ar_prestage_collect(unsigned set, const uint64_t offsets[3], const uint64_t sizes[3],
                                uint32_t *landed, uint64_t *bytes, double *wait_ms);
+static void ar_rd_stop(void);
 int ar_prefill_release(void) {
     /* End of the sweep: hand the staging reserve back before decode grows the
      * expert cache into it. */
     ar_prefill_ahead_join();
     (void)ar_prestage_collect(0, NULL, NULL, NULL, NULL, NULL);
+    ar_rd_stop();
     if (!ar_prefill_clear()) return 0;
     /* Argodrive 2026-09-26 (ARGODRIVE_PREFILL_RELEASE): DS4_ARGODRIVE_PREFILL_RELEASE=async
      * releases the two 3-buffer staging sets (about 14 GiB of wired pages) on a
@@ -13416,6 +13418,8 @@ static int ar_prestage_collect(unsigned set, const uint64_t offsets[3], const ui
         memcmp(offsets, ar_prestage_off, sizeof ar_prestage_off) == 0 &&
         memcmp(sizes, ar_prestage_len, sizeof ar_prestage_len) == 0;
 }
+static int ar_rd_enabled(void);
+static int ar_rd_install_job(unsigned set, const uint64_t offsets[3], const uint64_t sizes[3], uint64_t gate, uint64_t down, const int32_t *ranked, uint32_t n_ranked);
 int ar_prefill_prestage_start(const void *map, uint64_t size, const uint64_t offsets[3], const uint64_t sizes[3],
                               uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
                               const int32_t *ranked_ids, uint32_t n_ranked) {
@@ -13434,6 +13438,8 @@ int ar_prefill_prestage_start(const void *map, uint64_t size, const uint64_t off
     }
     const uint64_t n_expert = sizes[0] / gate_expert_bytes;
     if (!n_expert || n_expert > 65536) return 0;
+    if (ar_rd_enabled())
+        return ar_rd_install_job(set, offsets, sizes, gate_expert_bytes, down_expert_bytes, ranked_ids, n_ranked);
     if (ar_prestage_done_cap < n_expert) {
         free(ar_prestage_done);
         ar_prestage_done = calloc((size_t)n_expert, 1);
@@ -13454,6 +13460,139 @@ int ar_prefill_prestage_start(const void *map, uint64_t size, const uint64_t off
     return 1;
 }
 
+/* Argodrive 2026-10-04 (ARGODRIVE_PREFILL_READER): one continuous prefill reader instead of a
+ * read-ahead thread that is stopped at every router and restarted after every top-up. The
+ * lanes run for the whole sweep over a job (layer offsets, destination set, ranked ids). When
+ * the router ids arrive the main thread installs the top-up as priority work; lanes finish
+ * their current expert, then read only top-up experts until all selected experts are present,
+ * and the next layer's job replaces the current one without a stop. Each expert is claimed
+ * once (state 0 -> 1 -> 2) so the ranked flow and the top-up never read the same expert twice,
+ * and a stale lane finishing an old job updates the old job's state array, never the new one.
+ * Same bytes, same reader, same buffers; only the gaps between read phases disappear. */
+#define AR_RD_MAX_LANES 64
+static struct {
+    pthread_t lanes[AR_RD_MAX_LANES]; unsigned n_lanes; int started; int stop;
+    unsigned gen;                        /* job generation; parity selects the state array */
+    unsigned set; uint64_t off[3], len[3], gate, down;
+    const int32_t *ranked; uint32_t n_ranked; uint32_t cursor;
+    const int32_t *topup; uint32_t n_topup; uint32_t topup_cursor; int topup_active; int topup_hint; /* hint: fall back to the ranked list when exhausted */
+    uint8_t *state[2]; uint32_t cap;     /* per expert: 0 untouched, 1 in flight, 2 landed */
+    uint32_t landed; uint64_t bytes;
+} ar_rd;
+static int ar_rd_enabled(void) {
+    static int checked, on;
+    /* Opt-in (DS4_ARGODRIVE_PREFILL_READER=1), like every Argodrive switch: the 30 Sept profile on
+     * this binary reproduces the 30 Sept behaviour (one staging thread per layer). */
+    if (!checked) { const char *e = getenv("DS4_ARGODRIVE_PREFILL_READER"); on = e && *e && strcmp(e, "0") != 0; checked = 1; }
+    return on;
+}
+static int ar_rd_read_expert(unsigned gen, int32_t id) {
+    /* Reads one expert's three tensors for the job that was current at `gen`. The job fields
+     * are only rewritten under a new generation after the previous top-up completed, so a lane
+     * that observed `gen` may read them; a lane finishing after a switch writes an unused slot. */
+    const unsigned set = ar_rd.set; uint64_t off[3], len[3];
+    memcpy(off, ar_rd.off, sizeof off); memcpy(len, ar_rd.len, sizeof len);
+    const uint64_t gate = ar_rd.gate, down = ar_rd.down;
+    if (__atomic_load_n(&ar_rd.gen, __ATOMIC_ACQUIRE) != gen) return 0;
+    uint8_t *dst[3];
+    for (unsigned i = 0; i < 3; i++) { dst[i] = (uint8_t *)[ar_prefill_pool[set][i] contents]; if (!dst[i]) return 0; }
+    const uint64_t chunk = UINT64_C(32) << 20;
+    for (unsigned i = 0; i < 3; i++) {
+        const uint64_t per = (i == 2) ? down : gate, rel = (uint64_t)id * per;
+        if (rel > len[i] || per > len[i] - rel) return 0;
+        for (uint64_t done = 0; done < per; ) {
+            uint64_t take = per - done; if (take > chunk) take = chunk;
+            uint64_t got = 0;
+            if (!ar_read(&g_argodrive_reader, off[i] + rel + done, take, dst[i] + rel + done, &got) || got != take) return 0;
+            done += take;
+        }
+    }
+    __atomic_fetch_add(&ar_rd.bytes, 2 * gate + down, __ATOMIC_RELAXED);
+    return 1;
+}
+static void *ar_rd_lane(void *arg) {
+    (void)arg;
+    ar_set_decode_phase(0);
+    unsigned idle_spins = 0;
+    for (;;) {
+        if (__atomic_load_n(&ar_rd.stop, __ATOMIC_ACQUIRE)) return NULL;
+        const unsigned gen = __atomic_load_n(&ar_rd.gen, __ATOMIC_ACQUIRE);
+        uint8_t *state = ar_rd.state[gen & 1u];
+        int32_t id = -1;
+        if (__atomic_load_n(&ar_rd.topup_active, __ATOMIC_ACQUIRE)) {
+            /* priority work: top-up experts only, until the main thread lifts the flag */
+            for (;;) {
+                const uint32_t k = __atomic_fetch_add(&ar_rd.topup_cursor, 1u, __ATOMIC_RELAXED);
+                if (k >= ar_rd.n_topup) { id = -1; break; }
+                const int32_t c = ar_rd.topup[k];
+                uint8_t expect = 0;
+                if (c >= 0 && (uint32_t)c < ar_rd.cap && __atomic_compare_exchange_n(&state[c], &expect, (uint8_t)1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { id = c; break; }
+            }
+            if (id < 0 && !__atomic_load_n(&ar_rd.topup_hint, __ATOMIC_ACQUIRE)) { /* nothing claimable: wait for in-flight lanes or a job switch */
+                struct timespec ts = {0, 200000}; nanosleep(&ts, NULL); continue;
+            }
+        }
+        if (id < 0 && state && ar_rd.ranked) {
+            for (;;) {
+                const uint32_t k = __atomic_fetch_add(&ar_rd.cursor, 1u, __ATOMIC_RELAXED);
+                if (k >= ar_rd.n_ranked) { id = -1; break; }
+                const int32_t c = ar_rd.ranked[k];
+                uint8_t expect = 0;
+                if (c >= 0 && (uint32_t)c < ar_rd.cap && __atomic_compare_exchange_n(&state[c], &expect, (uint8_t)1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { id = c; break; }
+            }
+            if (id < 0) { /* ranked list exhausted: wait for the next job */
+                struct timespec ts = {0, (++idle_spins > 50) ? 2000000 : 200000}; nanosleep(&ts, NULL); continue;
+            }
+        } else if (id < 0) { struct timespec ts = {0, 500000}; nanosleep(&ts, NULL); continue; }
+        idle_spins = 0;
+        const int ok = ar_rd_read_expert(gen, id);
+        /* publish into the state array of the generation we read for; a stale generation's
+         * array is no longer consulted by anyone */
+        __atomic_store_n(&state[id], (uint8_t)(ok ? 2 : 3), __ATOMIC_RELEASE);
+        if (ok) __atomic_fetch_add(&ar_rd.landed, 1u, __ATOMIC_RELAXED);
+    }
+}
+static int ar_rd_start_lanes(void) {
+    if (ar_rd.started) return 1;
+    unsigned n = (unsigned)ar_prefill_lanes(); if (n > AR_RD_MAX_LANES) n = AR_RD_MAX_LANES;
+    ar_rd.stop = 0; ar_rd.n_lanes = 0;
+    for (unsigned i = 0; i < n; i++) {
+        if (pthread_create(&ar_rd.lanes[i], NULL, ar_rd_lane, NULL) != 0) break;
+        ar_rd.n_lanes++;
+    }
+    ar_rd.started = ar_rd.n_lanes > 0;
+    if (ar_rd.started) fprintf(stderr, "ds4: Argodrive continuous prefill reader: %u lanes\n", ar_rd.n_lanes);
+    return ar_rd.started;
+}
+static void ar_rd_stop(void) {
+    if (!ar_rd.started) return;
+    __atomic_store_n(&ar_rd.stop, 1, __ATOMIC_RELEASE);
+    for (unsigned i = 0; i < ar_rd.n_lanes; i++) (void)pthread_join(ar_rd.lanes[i], NULL);
+    ar_rd.started = 0; ar_rd.n_lanes = 0; ar_rd.ranked = NULL; ar_rd.n_ranked = 0; ar_rd.topup_active = 0;
+}
+/* Install the next layer's job: the ranked read-ahead into `set`. Called right after the
+ * previous layer's top-up completed (or before the sweep for layer 0). */
+static int ar_rd_install_job(unsigned set, const uint64_t offsets[3], const uint64_t sizes[3],
+                             uint64_t gate, uint64_t down, const int32_t *ranked, uint32_t n_ranked) {
+    const uint64_t n_expert = gate ? sizes[0] / gate : 0;
+    if (!n_expert || n_expert > 65536) return 0;
+    if (ar_rd.cap < n_expert) {
+        for (unsigned j = 0; j < 2; j++) { free(ar_rd.state[j]); ar_rd.state[j] = calloc((size_t)n_expert, 1); if (!ar_rd.state[j]) { ar_rd.cap = 0; return 0; } }
+        ar_rd.cap = (uint32_t)n_expert;
+    }
+    const unsigned next = ar_rd.gen + 1u;
+    memset(ar_rd.state[next & 1u], 0, ar_rd.cap);
+    /* lanes may still be finishing experts of the current job; they only touch the current
+     * array. Switch fields, then publish the generation. */
+    __atomic_store_n(&ar_rd.topup_active, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&ar_rd.topup_hint, 0, __ATOMIC_RELEASE);
+    ar_rd.set = set; memcpy(ar_rd.off, offsets, sizeof ar_rd.off); memcpy(ar_rd.len, sizes, sizeof ar_rd.len);
+    ar_rd.gate = gate; ar_rd.down = down; ar_rd.ranked = ranked; ar_rd.n_ranked = n_ranked;
+    __atomic_store_n(&ar_rd.cursor, 0u, __ATOMIC_RELAXED);
+    ar_rd.topup = NULL; ar_rd.n_topup = 0; __atomic_store_n(&ar_rd.topup_cursor, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&ar_rd.gen, next, __ATOMIC_RELEASE);
+    return ar_rd_start_lanes();
+}
 /* Two-phase selective staging (Argodrive 2026-09-30, two-wave routed MoE): begin()
  * collects the read-ahead, decides the top-up and publishes the views, so kernels can
  * already address the experts that landed while finish() reads the rest. Kernels
@@ -13461,9 +13600,29 @@ int ar_prefill_prestage_start(const void *map, uint64_t size, const uint64_t off
  * ar_prefill_stage_ids() = begin + finish, the original one-shot behaviour. */
 static struct {
     int active; unsigned set; uint64_t off[3], len[3], gate, down;
-    uint32_t n_topup, n_hit, pre_landed; uint64_t pre_bytes; double pre_wait, t0; uint64_t before[3]; int pre_valid;
+    uint32_t n_topup, n_hit, pre_landed; uint64_t pre_bytes; double pre_wait, t0; uint64_t before[3]; int pre_valid; int reader;
 } ar_stage2;
 static int32_t ar_stage2_topup[65536];
+static int32_t ar_stage2_hint[65536];
+/* Argodrive 2026-10-04 (ARGODRIVE_PREFILL_SPLIT_ROUTER): the first half of the prompt's router ids are
+ * known ~half an attention earlier than the whole layer's. Hand them to the running lanes as priority
+ * work, so the drives read experts this layer certainly needs instead of ranked guesses while the GPU
+ * runs the second half. begin() later installs the real top-up list over this one; ids already landed
+ * or in flight are simply counted as landed / waited for. Returns the number of ids queued. */
+uint32_t ar_prefill_stage_ids_hint(const int32_t *ids, uint32_t n_ids) {
+    if (ar_stage2.active || !ar_rd.started || !ids || !n_ids) return 0;
+    const uint8_t *state = ar_rd.state[__atomic_load_n(&ar_rd.gen, __ATOMIC_ACQUIRE) & 1u];
+    uint32_t n = 0;
+    for (uint32_t k = 0; k < n_ids && n < 65536; k++) {
+        const int32_t id = ids[k];
+        if (id >= 0 && (uint32_t)id < ar_rd.cap && __atomic_load_n(&state[id], __ATOMIC_ACQUIRE) == 0) ar_stage2_hint[n++] = id;
+    }
+    if (!n) return 0;
+    ar_rd.topup = ar_stage2_hint; ar_rd.n_topup = n; __atomic_store_n(&ar_rd.topup_cursor, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&ar_rd.topup_hint, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&ar_rd.topup_active, 1, __ATOMIC_RELEASE);
+    return n;
+}
 int ar_prefill_stage_ids_begin(const void *map, uint64_t size, const uint64_t offsets[3], const uint64_t sizes[3],
                                uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
                                const int32_t *ids, uint32_t n_ids, uint8_t *landed) {
@@ -13473,19 +13632,41 @@ int ar_prefill_stage_ids_begin(const void *map, uint64_t size, const uint64_t of
     ar_stage2.t0 = ds4_gpu_now_ms();
     ar_expert_bytes_snapshot(ar_stage2.before);
     const unsigned set = ar_prefill_published_set ^ 1u;
-    /* Read-ahead first: stop it, keep what landed for this layer, read only the rest. */
     uint32_t pre_landed = 0; uint64_t pre_bytes = 0; double pre_wait = 0; uint32_t pre_hit = 0;
-    const int pre_valid = ar_prestage_collect(set, offsets, sizes, &pre_landed, &pre_bytes, &pre_wait) &&
-        ar_prestage_gate == gate_expert_bytes && ar_prestage_down == down_expert_bytes;
     uint32_t n_topup = 0;
-    for (uint32_t k = 0; k < n_ids; k++) {
-        const int32_t id = ids[k];
-        const int hit = pre_valid && id >= 0 && (uint32_t)id < ar_prestage_done_cap &&
-            __atomic_load_n(&ar_prestage_done[id], __ATOMIC_ACQUIRE);
-        if (landed) landed[k] = (uint8_t)hit;
-        if (hit) pre_hit++;
-        else if (n_topup < 65536) ar_stage2_topup[n_topup++] = id;
-        else return 0;
+    const int reader = ar_rd.started && ar_rd.set == set && memcmp(offsets, ar_rd.off, sizeof ar_rd.off) == 0 &&
+        memcmp(sizes, ar_rd.len, sizeof ar_rd.len) == 0 && ar_rd.gate == gate_expert_bytes && ar_rd.down == down_expert_bytes;
+    int pre_valid;
+    if (reader) {
+        /* Continuous reader: no stop, no join. Experts already landed count as hits; the rest
+         * become priority work for the lanes that are already running. */
+        const uint8_t *state = ar_rd.state[__atomic_load_n(&ar_rd.gen, __ATOMIC_ACQUIRE) & 1u];
+        for (uint32_t k = 0; k < n_ids; k++) {
+            const int32_t id = ids[k];
+            const int hit = id >= 0 && (uint32_t)id < ar_rd.cap && __atomic_load_n(&state[id], __ATOMIC_ACQUIRE) == 2;
+            if (landed) landed[k] = (uint8_t)hit;
+            if (hit) pre_hit++;
+            else if (n_topup < 65536) ar_stage2_topup[n_topup++] = id;
+            else return 0;
+        }
+        pre_landed = __atomic_load_n(&ar_rd.landed, __ATOMIC_RELAXED); pre_bytes = __atomic_load_n(&ar_rd.bytes, __ATOMIC_RELAXED);
+        ar_rd.topup = ar_stage2_topup; ar_rd.n_topup = n_topup; __atomic_store_n(&ar_rd.topup_cursor, 0u, __ATOMIC_RELAXED);
+        __atomic_store_n(&ar_rd.topup_hint, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&ar_rd.topup_active, 1, __ATOMIC_RELEASE);
+        pre_valid = 1;
+    } else {
+        /* Read-ahead thread (reader disabled): stop it, keep what landed, read only the rest. */
+        pre_valid = ar_prestage_collect(set, offsets, sizes, &pre_landed, &pre_bytes, &pre_wait) &&
+            ar_prestage_gate == gate_expert_bytes && ar_prestage_down == down_expert_bytes;
+        for (uint32_t k = 0; k < n_ids; k++) {
+            const int32_t id = ids[k];
+            const int hit = pre_valid && id >= 0 && (uint32_t)id < ar_prestage_done_cap &&
+                __atomic_load_n(&ar_prestage_done[id], __ATOMIC_ACQUIRE);
+            if (landed) landed[k] = (uint8_t)hit;
+            if (hit) pre_hit++;
+            else if (n_topup < 65536) ar_stage2_topup[n_topup++] = id;
+            else return 0;
+        }
     }
     if (!ar_prefill_clear()) {
         fprintf(stderr, "ds4: Argodrive prefill stage rejected: previous views still held (commands_active=%d)\n",
@@ -13514,7 +13695,7 @@ int ar_prefill_stage_ids_begin(const void *map, uint64_t size, const uint64_t of
     memcpy(ar_stage2.len, sizes, sizeof ar_stage2.len);
     ar_stage2.gate = gate_expert_bytes; ar_stage2.down = down_expert_bytes;
     ar_stage2.n_topup = n_topup; ar_stage2.n_hit = pre_hit; ar_stage2.pre_landed = pre_landed;
-    ar_stage2.pre_bytes = pre_bytes; ar_stage2.pre_wait = pre_wait; ar_stage2.pre_valid = pre_valid;
+    ar_stage2.pre_bytes = pre_bytes; ar_stage2.pre_wait = pre_wait; ar_stage2.pre_valid = pre_valid; ar_stage2.reader = reader;
     ar_stage2.active = 1;
     return 1;
 }
@@ -13528,6 +13709,35 @@ int ar_prefill_stage_ids_finish_part(uint32_t part, uint32_t parts) {
     const uint32_t k1 = (uint32_t)(((uint64_t)ar_stage2.n_topup * (part + 1u)) / parts);
     const int32_t *ids = ar_stage2_topup + k0; const uint32_t n_ids = k1 - k0;
     if (part == 0) ar_stage2_requested = 0;
+    if (ar_stage2.reader) {
+        /* Wait until every expert of this part has landed through the lanes. */
+        const uint8_t *state = ar_rd.state[__atomic_load_n(&ar_rd.gen, __ATOMIC_ACQUIRE) & 1u];
+        for (uint32_t k = 0; k < n_ids; k++) {
+            const int32_t id = ids[k];
+            for (;;) {
+                const uint8_t st = __atomic_load_n(&state[id], __ATOMIC_ACQUIRE);
+                if (st == 2) break;
+                if (st == 3) { fprintf(stderr, "ds4: Argodrive prefill read failed on expert %d; layer not published\n", id);
+                    for (unsigned j = 0; j < 3; j++) ar_prefill_views[j] = (ar_prefill_view){0};
+                    __atomic_store_n(&ar_rd.topup_active, 0, __ATOMIC_RELEASE); ar_stage2.active = 0; return 0; }
+                struct timespec ts = {0, 100000}; nanosleep(&ts, NULL);
+            }
+            ar_stage2_requested += 2 * ar_stage2.gate + ar_stage2.down;
+        }
+        if (part + 1u < parts) return 1;
+        __atomic_store_n(&ar_rd.topup_active, 0, __ATOMIC_RELEASE);
+        ar_stage2.active = 0;
+        uint64_t total = 0; for (unsigned i = 0; i < 3; i++) total += ar_stage2.len[i];
+        uint64_t after[3]; ar_expert_bytes_snapshot(after);
+        fprintf(stderr, "ds4: Argodrive prefill staged(selected) experts=%u bytes=%llu of %llu (%.0f%%)"
+                " source_bytes=%llu,%llu,%llu ms=%.3f ahead: hit=%u landed=%u bytes=%llu topup=%u wait_ms=0.0 reader=1 parts=%u\n",
+                ar_stage2.n_topup + ar_stage2.n_hit, (unsigned long long)ar_stage2_requested, (unsigned long long)total,
+                100.0 * (double)ar_stage2_requested / (double)total,
+                (unsigned long long)(after[0]-ar_stage2.before[0]), (unsigned long long)(after[1]-ar_stage2.before[1]),
+                (unsigned long long)(after[2]-ar_stage2.before[2]), ds4_gpu_now_ms() - ar_stage2.t0,
+                ar_stage2.n_hit, ar_stage2.pre_landed, (unsigned long long)ar_stage2.pre_bytes, ar_stage2.n_topup, parts);
+        return 1;
+    }
     /* Consecutive expert ids coalesce into one read; 32 MiB is the largest piece so
      * the lanes keep every drive busy the way the full-layer path does. */
     static ar_prefill_piece pieces[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * 4u];
@@ -13642,6 +13852,7 @@ int ar_prefill_stage(const void *map, uint64_t size, const uint64_t offsets[3], 
     unsigned set=ar_prefill_published_set^1u;
     int prefetched=0;
     (void)ar_prestage_collect(set,offsets,sizes,NULL,NULL,NULL); /* never two writers on one set */
+    ar_rd_stop();
     if (ar_ahead_running) {
         ar_prefill_ahead_join();
         if (ar_ahead_ok && memcmp(ar_ahead_off,offsets,sizeof ar_ahead_off)==0 &&
@@ -13679,6 +13890,37 @@ int ar_prefill_stage_ahead(const void *map, uint64_t size, const uint64_t offset
     ar_ahead_ok=0;
     if (pthread_create(&ar_ahead_thread,NULL,ar_prefill_ahead_main,NULL)!=0) return 0;
     ar_ahead_running=1;
+    return 1;
+}
+
+/* Argodrive 2026-10-04 (ARGODRIVE_PREFILL_PREWARM): allocate both prefill staging sets at model
+ * load and touch every page from the GPU, so the first layers of the first prompt do not pay
+ * the buffers' first-use cost inside the timed prefill. Load-time work only; the sets are the
+ * same ones the sweep would allocate on demand. */
+int ds4_gpu_argodrive_prefill_prewarm(uint64_t gate_bytes, uint64_t up_bytes, uint64_t down_bytes) {
+    if (!g_ssd_streaming_mode || !gate_bytes || !up_bytes || !down_bytes) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const double t0 = ds4_gpu_now_ms();
+    const uint64_t sizes[3] = { gate_bytes, up_bytes, down_bytes };
+    id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+    if (!cb) return 0;
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    uint64_t total = 0;
+    for (unsigned set = 0; set < 2; set++) {
+        for (unsigned i = 0; i < 3; i++) {
+            if (!ar_prefill_pool[set][i] || ar_prefill_pool_bytes[set][i] < sizes[i]) {
+                id<MTLBuffer> fresh = [g_device newBufferWithLength:(NSUInteger)sizes[i] options:MTLResourceStorageModeShared];
+                if (!fresh) { [blit endEncoding]; fprintf(stderr, "ds4: Argodrive prefill prewarm: cannot allocate %.2f GiB\n", ds4_gpu_gib(sizes[i])); return 0; }
+                ar_prefill_pool[set][i] = fresh; ar_prefill_pool_bytes[set][i] = sizes[i];
+            }
+            [blit fillBuffer:ar_prefill_pool[set][i] range:NSMakeRange(0, (NSUInteger)sizes[i]) value:0];
+            total += sizes[i];
+        }
+    }
+    [blit endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    fprintf(stderr, "ds4: Argodrive prefill prewarm: two staging sets, %.2f GiB touched on the GPU in %.0f ms\n", ds4_gpu_gib(total), ds4_gpu_now_ms() - t0);
     return 1;
 }
 
@@ -18813,6 +19055,11 @@ int ds4_gpu_argodrive_flag_readback_finish(const ds4_gpu_stream_expert_table *ta
     }
     for (uint32_t i = 0; i < n_selected; i++) g_ar_last_ids[i] = ids[i];
     g_ar_last_n = n_selected;
+    /* Argodrive 2026-10-04 (ARGODRIVE_DECODE_IDS_DUMP): one line per layer, "layer id0 .. id5", so the
+     * decode routing stream can replay cache policies offline. Diagnostic; not part of any profile. */
+    { static FILE *ar_dump; static int ar_dump_checked;
+      if (!ar_dump_checked) { ar_dump_checked = 1; const char *dp = getenv("DS4_ARGODRIVE_DECODE_IDS_DUMP"); if (dp && *dp) ar_dump = fopen(dp, "w"); }
+      if (ar_dump) { fprintf(ar_dump, "%u", table->layer); for (uint32_t i = 0; i < n_selected; i++) fprintf(ar_dump, " %d", ids[i]); fputc('\n', ar_dump); } }
     if (!ds4_gpu_stream_expert_cache_begin_selected_load(table, ids, n_selected)) return 0;
     ds4_gpu_glm_stream_selected_prefetch_set(table, ids, n_selected);
     return 1;

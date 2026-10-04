@@ -64,3 +64,30 @@ class Stack0930ProfileTests(unittest.TestCase):
         for l in lines:
             self.assertEqual(int(l[1]), len(l) - 2)
             self.assertGreaterEqual(int(l[1]), 300)
+
+
+class Stack1004ProfileTests(unittest.TestCase):
+    def test_exports_previous_plus_exactly_the_reader_and_engram_switches(self):
+        old = ds41_fork_profile('/primary', ['/one', '/two'], 'v41-stack-20260930')
+        new = ds41_fork_profile('/primary', ['/one', '/two'], 'v41-stack-20261004')
+        added = {k: v for k, v in new['environment'].items() if old['environment'].get(k) != v}
+        self.assertEqual({k: v for k, v in added.items() if k != 'DS4_ARGODRIVE_COOC'},
+                         {'DS4_ARGODRIVE_PREFILL_READER': '1', 'DS4_ARGODRIVE_ENGRAM_PREFETCH_MIN': '1',
+                          'DS4_ARGODRIVE_ENGRAM_BATCH_READERS': '128'})
+        self.assertTrue(added['DS4_ARGODRIVE_COOC'].endswith('hotlists/v41-flash-q4-cooc-20261004.bin'))
+        self.assertEqual({k: v for k, v in old['environment'].items() if k not in added}, {k: v for k, v in new['environment'].items() if k not in added})
+        self.assertEqual(new['cache_experts'], old['cache_experts'])
+        self.assertEqual(new['errors'], [])
+        self.assertIn('continuous reader', new['scope'])
+
+    def test_profile_is_a_run_choice(self):
+        source = open(Path(__file__).resolve().parents[1] / 'run.py').read()
+        self.assertIn("'v41-stack-20261004'", source)
+
+    def test_conditional_prior_table_matches_the_model(self):
+        import struct
+        new = ds41_fork_profile('/primary', ['/one', '/two'], 'v41-stack-20261004')
+        with open(new['environment']['DS4_ARGODRIVE_COOC'], 'rb') as f:
+            magic, nl, ne = f.read(8), *struct.unpack('<II', f.read(8))
+        self.assertEqual((magic, nl, ne), (b'ARCOOC01', 40, 384))
+        self.assertEqual(Path(new['environment']['DS4_ARGODRIVE_COOC']).stat().st_size, 16 + (nl - 1) * ne * ne * 2 + nl * ne * 4)
