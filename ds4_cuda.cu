@@ -341,6 +341,7 @@ typedef struct {
 static cuda_moe_decode_graph_cache g_moe_decode_graph[DS4_MAX_GPUS];
 
 static int cuda_q4_mma_ok(void);
+static int cuda_q4_mma_wide(void);
 
 
 
@@ -7364,6 +7365,15 @@ static int cuda_q4_mma_ok(void) {
         }
     }
     return cached;
+}
+
+/* DS4_CUDA_MOE_Q4_MMA_WIDE=1 (spec24): let the exact INT8 tensor-core expert-tile kernels
+ * stage up to 20 gate/up and 9 down activation blocks (V4.1 Flash: n_embd 5120, n_ff_exp
+ * 2304) instead of the 16/8 they were sized for. Same math and reduction order. */
+static int cuda_q4_mma_wide(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DS4_CUDA_MOE_Q4_MMA_WIDE"); on = e && strcmp(e, "0") != 0; }
+    return on;
 }
 static int cuda_q8_mma_attr_ready[DS4_MAX_GPUS][4];
 static int cuda_q8_mma_try_launch(
@@ -24206,7 +24216,7 @@ __global__ static void moe_gate_up_mid_q4K_tile8_mma_kernel(
     const uint32_t warp = threadIdx.x >> 5u;
     uint32_t expert = tile_experts[tile];
     uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][16];
+    __shared__ cuda_block_q8_K sxq[8][20];   /* spec24: up to 20 staged blocks */
     __shared__ uint32_t s_pair[8];
     __shared__ uint32_t s_tok[8];
     __shared__ uint32_t s_slot[8];
@@ -24225,7 +24235,7 @@ __global__ static void moe_gate_up_mid_q4K_tile8_mma_kernel(
     }
     __syncthreads();
     const uint32_t np = s_np;
-    if (xq_blocks <= 16u) {
+    if (xq_blocks <= 20u) {
         for (uint32_t i = threadIdx.x; i < np * xq_blocks * (uint32_t)(sizeof(cuda_block_q8_K) / 4u); i += blockDim.x) {
             const uint32_t words_per_tok = xq_blocks * (uint32_t)(sizeof(cuda_block_q8_K) / 4u);
             uint32_t p = i / words_per_tok;
@@ -24368,7 +24378,7 @@ __global__ static void moe_down_q4K_tile8_mma_kernel(
     const uint32_t warp = threadIdx.x >> 5u;
     uint32_t expert = tile_experts[tile];
     uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][8];
+    __shared__ cuda_block_q8_K sxq[8][9];    /* spec24: up to 9 staged blocks */
     __shared__ uint32_t s_pair[8];
     __shared__ uint32_t s_np;
     if (threadIdx.x == 0) {
@@ -24382,7 +24392,7 @@ __global__ static void moe_down_q4K_tile8_mma_kernel(
     }
     __syncthreads();
     const uint32_t np = s_np;
-    if (midq_blocks <= 8u) {
+    if (midq_blocks <= 9u) {
         const uint32_t words_per_tok = midq_blocks * (uint32_t)(sizeof(cuda_block_q8_K) / 4u);
         for (uint32_t i = threadIdx.x; i < np * words_per_tok; i += blockDim.x) {
             uint32_t p = i / words_per_tok;
@@ -26292,7 +26302,7 @@ static int routed_moe_launch(
                     const int use_q4_mma = cuda_q4_mma_ok() &&
                         ((((uintptr_t)gate_w | (uintptr_t)up_w |
                            gate_row_bytes | gate_expert_bytes) & 15u) == 0u) &&
-                        xq_blocks <= 16u && (expert_mid_dim & 7u) == 0u;
+                        xq_blocks <= (cuda_q4_mma_wide() ? 20u : 16u) && (expert_mid_dim & 7u) == 0u;
                     const int use_q4_mma_t16 = use_q4_mma && use_q4_mma_tiles16 &&
                         tile16_total && tile16_experts && tile16_starts &&
                         xq_blocks == 16u && cuda_q4_mma_tile16_shmem_ok(0);
@@ -26776,7 +26786,7 @@ static int routed_moe_launch(
                 if (q4k_path) {
                     const int use_q4_down_mma = cuda_q4_mma_ok() &&
                         ((((uintptr_t)down_w | down_row_bytes | down_expert_bytes) & 15u) == 0u) &&
-                        midq_blocks <= 8u && (out_dim & 7u) == 0u;
+                        midq_blocks <= (cuda_q4_mma_wide() ? 9u : 8u) && (out_dim & 7u) == 0u;
                     const int use_q4_down_t16 = use_q4_down_mma && use_q4_mma_tiles16 &&
                         tile16_total && tile16_experts && tile16_starts &&
                         midq_blocks <= 16u && cuda_q4_mma_tile16_shmem_ok(1);
