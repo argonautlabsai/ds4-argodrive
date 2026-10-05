@@ -23250,7 +23250,7 @@ __global__ static void moe_gate_up_mid_q4K_expert_tile8_rowspan_kernel(
     uint32_t row_lane = threadIdx.x >> 3u;
     uint32_t expert = tile_experts[tile];
     uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][16];
+    __shared__ cuda_block_q8_K sxq[8][20];   /* spec23: stage up to 20 blocks (n_embd 5120) */
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -23264,7 +23264,7 @@ __global__ static void moe_gate_up_mid_q4K_expert_tile8_rowspan_kernel(
         slot[np] = pair[np] - tok[np] * n_expert;
         xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
     }
-    if (xq_blocks <= 16u) {
+    if (xq_blocks <= 20u) {
         for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
             uint32_t p = i / xq_blocks;
             uint32_t b = i - p * xq_blocks;
@@ -24121,7 +24121,7 @@ __global__ static void moe_down_q4K_expert_tile8_rowspan_kernel(
     uint32_t row_lane = threadIdx.x >> 3u;
     uint32_t expert = tile_experts[tile];
     uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[8][8];
+    __shared__ cuda_block_q8_K sxq[8][9];    /* spec23: stage up to 9 blocks (n_ff_exp 2304) */
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     const cuda_block_q8_K *xqb[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
     uint32_t np = 0;
@@ -24131,7 +24131,7 @@ __global__ static void moe_down_q4K_expert_tile8_rowspan_kernel(
         pair[np] = sorted_pairs[offsets[expert] + local_pair];
         xqb[np] = midq + (uint64_t)pair[np] * midq_blocks;
     }
-    if (midq_blocks <= 8u) {
+    if (midq_blocks <= 9u) {
         for (uint32_t i = threadIdx.x; i < np * midq_blocks; i += blockDim.x) {
             uint32_t p = i / midq_blocks;
             uint32_t b = i - p * midq_blocks;
