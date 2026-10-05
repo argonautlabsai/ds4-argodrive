@@ -208,6 +208,25 @@ static std::unordered_map<uint64_t, uint32_t> g_stream_expert_by_gate;
 static uint64_t g_stream_expert_clock = 1;
 /* Deferred-miss MoE (DS4_CUDA_MOE_DEFER=1): see cuda_routed_moe_deferred(). */
 static int g_moe_skip_load = 0;          /* routed_moe_launch: use the cache as set, do not load */
+/* DS4_CUDA_PREFILL_WAVES=1 (spec25): two-pass prefill MoE. Pass 1 runs the routed MoE over
+ * the pairs whose experts are already VRAM-resident BEFORE the host loads the misses, so the
+ * GPU computes while the disk and DMA work; pass 2 runs the pairs that were just loaded; the
+ * fixed-order sum runs once after both. Per-pair arithmetic and the sum order are unchanged,
+ * so the result is bit-identical to the single pass. g_wave_mode: 0 normal; 1 = hits only
+ * (publish a remap with misses masked to -1, skip the miss loop); 2 = load the misses with no
+ * stream sync and publish a remap masked to the loaded experts. */
+static int g_begin_load_skip_sync = 0;   /* begin_load: the caller already drained the stream */
+static int cuda_stream_selected_cache_begin_load(const ds4_gpu_stream_expert_table *, const int32_t *, uint32_t);
+static int g_wave_mode = 0;
+static int g_wave_pending = 0;
+static std::vector<int32_t> g_wave_ids;         /* host router ids saved by mode 1 for mode 2 */
+static std::vector<int32_t> g_wave_full_remap;  /* full per-pair slot ids, restored after pass 2 */
+static uint64_t g_wave_layers = 0, g_wave_hit_pairs = 0, g_wave_pairs = 0;
+static int cuda_prefill_waves(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DS4_CUDA_PREFILL_WAVES"); on = e && strcmp(e, "0") != 0; }
+    return on;
+}
 /* Decode-only (slot_count == 6) host-side intervals, so the per-token partition is
  * measured rather than estimated: readback = id copy wait; begin_load = whole host
  * phase (index, loads, DMA wait, remap); load = read+issue part; upload = DMA wait. */
@@ -223,7 +242,6 @@ static void cuda_decode_partition_report(void) {
             40.0 * g_pd_readback_ms / (double)g_pd_layers, 40.0 * g_pd_begin_ms / (double)g_pd_layers);
     (void)fflush(stderr);
 }
-static int g_begin_load_skip_sync = 0;   /* begin_load: the caller already drained the stream */
 static int g_remap_via_upload_stream = 0; /* begin_load: write the remap through the upload stream (legacy stream is gated) */
 static uint64_t g_chunked_reads = 0, g_chunked_pieces = 0; /* DS4_CUDA_EXPERT_CHUNKS statistics */
 static int g_slot_table_rebuild = 1;     /* host mirror must be rebuilt from the index */
@@ -25506,14 +25524,23 @@ static int routed_moe_launch(
     const int mxfp4_path = (gate_type == 39u && down_type == 39u);
     if (!q4k_path && !iq2_path && !mxfp4_path) return 0;
 
+    int wave_passes = 1;
+    ds4_gpu_stream_expert_table wave_table = {};   /* the table of the first load, reused by pass 2 */
     if (g_ssd_streaming_mode && !owned_filtered) {
         if (!g_moe_skip_load) {
             const ds4_gpu_stream_expert_table table = {
                 model_map, model_size, layer_index, n_total_expert,
                 gate_offset, up_offset, down_offset, gate_expert_bytes, down_expert_bytes};
-            if ((uint64_t)n_tokens * n_expert > UINT32_MAX ||
-                !ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
-                    &table, selected, n_tokens * n_expert)) return 0;
+            wave_table = table;
+            const int waves = cuda_prefill_waves() && q4k_path && n_tokens >= 64u;
+            g_wave_mode = waves ? 1 : 0;
+            g_wave_pending = 0;
+            const int ld_ok = (uint64_t)n_tokens * n_expert <= UINT32_MAX &&
+                ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                    &table, selected, n_tokens * n_expert);
+            g_wave_mode = 0;
+            if (!ld_ok) return 0;
+            if (waves && g_wave_pending) wave_passes = 2;
         }
         allow_streaming = 1;
     }
@@ -26004,8 +26031,29 @@ static int routed_moe_launch(
     const uint64_t midq_count = (uint64_t)n_tokens * n_expert * midq_blocks;
     const uint64_t xq_bytes = xq_count * sizeof(cuda_block_q8_K);
     const uint64_t midq_bytes = midq_count * sizeof(cuda_block_q8_K);
+    for (int wave_pass = 0; wave_pass < wave_passes; wave_pass++) {
+    if (wave_pass == 1) {
+        /* Pass 2: load the missing experts while pass 1 runs on the GPU, then publish a remap
+         * masked to them. No stream sync: nothing in the load depends on pass-1 results. */
+        /* The launcher rewrites model_map/offsets/n_total_expert for the cache after the first
+         * load, so pass 2 must reuse the table that load was given. */
+        g_wave_mode = 2; g_begin_load_skip_sync = 1;
+        const int ld2 = cuda_stream_selected_cache_begin_load(&wave_table, g_wave_ids.data(), n_tokens * n_expert);
+        g_wave_mode = 0; g_begin_load_skip_sync = 0;
+        if (!ld2) { fprintf(stderr, "ds4: prefill waves: pass-2 expert load failed at layer %u\n", layer_index); return 0; }
+    }
     if (down->bytes >= xq_bytes && gate->bytes >= midq_bytes) {
         cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
+        if (wave_passes == 2) {
+            /* Pass 1's down kernel writes down->ptr, so the activations need other scratch: the up
+             * buffer is unused in the default path (no aux outputs, no midq sidecar). */
+            if (getenv("DS4_CUDA_MOE_WRITE_GATE_UP") || getenv("DS4_CUDA_MOE_MIDQ_SIDECAR") || up->bytes < xq_bytes) {
+                fprintf(stderr, "ds4: prefill waves: no scratch for the activations (up bytes %llu < %llu or aux outputs on); layer %u\n",
+                        (unsigned long long)up->bytes, (unsigned long long)xq_bytes, layer_index);
+                return 0;
+            }
+            xq = (cuda_block_q8_K *)up->ptr;
+        }
         cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
         const uint32_t profile_moe = getenv("DS4_CUDA_MOE_PROFILE") != NULL;
         cudaEvent_t prof_ev[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
@@ -26185,8 +26233,10 @@ static int routed_moe_launch(
         uint32_t tile_capacity = 0;
         uint32_t tile16_capacity = 0;
         dim3 xq_grid(xq_blocks, n_tokens, 1);
-        q8_K_quantize_kernel<<<xq_grid, 256, 0, cuda_decode_stream()>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
-        ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
+        if (wave_pass == 0) {   /* pass 2 reuses the activations quantised in pass 1 */
+            q8_K_quantize_kernel<<<xq_grid, 256, 0, cuda_decode_stream()>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
+            ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
+        }
         if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
         if (ok && use_sorted_pairs) {
             const uint64_t counts_bytes = (uint64_t)n_total_expert * sizeof(uint32_t);
@@ -26971,7 +27021,7 @@ static int routed_moe_launch(
             ok = cuda_ok(cudaGetLastError(), "routed_moe down launch");
         }
         if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
-        if (ok && !use_atomic_down && !use_direct_down_sum) {
+        if (ok && !use_atomic_down && !use_direct_down_sum && wave_pass + 1 >= wave_passes) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
             if (use_owned_sparse_buffers) {
                 moe_sum_owned_kernel<<<(n + 255) / 256, 256, 0, cuda_decode_stream()>>>(
@@ -27008,7 +27058,18 @@ static int routed_moe_launch(
             }
             for (uint32_t i = 0; i < 7u; i++) (void)cudaEventDestroy(prof_ev[i]);
         }
-        return ok;
+        if (!ok || wave_pass + 1 >= wave_passes) {
+            if (ok && wave_passes == 2) {
+                /* Restore the full per-pair slot map for anything that reads it after the MoE. */
+                ok = cuda_ok(cudaMemcpy(g_stream_selected_cache.slot_selected_ptr, g_wave_full_remap.data(),
+                        (size_t)n_tokens * n_expert * sizeof(int32_t), cudaMemcpyHostToDevice),
+                        "stream wave remap restore");
+            }
+            return ok;
+        }
+        continue;
+    }
+    if (wave_passes == 2) { fprintf(stderr, "ds4: prefill waves: sorted Q4_K block not taken at layer %u\n", layer_index); return 0; }
     }
 
     if (ok) {
@@ -29444,8 +29505,10 @@ static int cuda_stream_selected_cache_begin_load(
     cuda_stream_prefetch_before_load(table);
     cuda_stream_selected_cache_invalidate();
     if (!g_ssd_streaming_mode) return 1;
-    if (!cuda_stream_selected_ranges_valid(table) || !selected_ids || !slot_count)
+    if (!cuda_stream_selected_ranges_valid(table) || !selected_ids || !slot_count) {
+        fprintf(stderr, "ds4: begin_load: invalid ranges/ids (layer %u, mode %d, ids %p, count %u)\n", table->layer, g_wave_mode, (const void *)selected_ids, slot_count);
         return 0;
+    }
     if (g_n_gpus != 1) {
         fprintf(stderr, "ds4: CUDA SSD streaming requires single-GPU placement\n");
         return 0;
@@ -29641,6 +29704,46 @@ static int cuda_stream_selected_cache_begin_load(
         }
         g_ph_hits_ms += cuda_now_ms() - t_ph0;
         g_ph_layers++;
+        std::vector<char> wave_was_hit;
+        if (g_wave_mode == 2) {
+            wave_was_hit.resize(unique.size());
+            for (size_t i = 0; i < unique.size(); i++) wave_was_hit[i] = slots[i] >= 0 ? 1 : 0;
+        }
+        if (g_wave_mode == 1) {
+            g_wave_pending = 0;
+            size_t n_miss = 0;
+            for (size_t i = 0; i < unique.size(); i++) if (slots[i] < 0) n_miss++;
+            if (n_miss > 0 && n_miss < unique.size()) {
+                /* Pass 1: publish the resident pairs now; the caller launches their MoE and
+                 * then calls back in mode 2 for the misses while those kernels run. */
+                g_wave_ids.assign(selected_ids, selected_ids + slot_count);
+                std::vector<int32_t> w1(slot_count);
+                uint64_t hit_pairs = 0;
+                for (uint32_t p = 0; p < slot_count; p++) { w1[p] = slots[remap[p]]; if (w1[p] >= 0) hit_pairs++; }
+                if (!cuda_stream_selected_ensure_i32(slot_count)) return 0;
+                if (!cuda_ok(cudaMemcpy(cache.slot_selected_ptr, w1.data(),
+                        (size_t)slot_count * sizeof(int32_t), cudaMemcpyHostToDevice),
+                        "stream wave-1 remap copy")) return 0;
+                cache.layer = table->layer;
+                cache.n_total_expert = table->n_total_expert;
+                cache.slot_count = slot_count;
+                cache.compact_count = (uint32_t)g_stream_expert_slots.size();
+                cache.gate_offset = table->gate_offset;
+                cache.up_offset = table->up_offset;
+                cache.down_offset = table->down_offset;
+                cache.slot_selected_tensor.ptr = cache.slot_selected_ptr;
+                cache.slot_selected_tensor.bytes = (uint64_t)slot_count * sizeof(int32_t);
+                cache.slot_selected_tensor.owner = 0;
+                cache.slot_selected_tensor.device_id = 0;
+                cache.valid = 1;
+                g_wave_layers++; g_wave_hit_pairs += hit_pairs; g_wave_pairs += slot_count;
+                if (g_wave_layers % 400u == 0u)
+                    fprintf(stderr, "ds4: prefill waves: %llu split layers, resident pairs %.1f%% ran under the loads\n",
+                            (unsigned long long)g_wave_layers, 100.0 * (double)g_wave_hit_pairs / (double)g_wave_pairs);
+                g_wave_pending = 1;
+                return 1;
+            }
+        }
         cuda_stream_upload_batch uploads;
         double t_vic = 0.0;
         std::vector<uint32_t> filled;
@@ -29714,7 +29817,7 @@ static int cuda_stream_selected_cache_begin_load(
             }
             t_vic += cuda_now_ms() - t_v0;
             g_ph_victim_iters += g_stream_expert_slots.size();
-            if (victim == UINT32_MAX) return 0;
+            if (victim == UINT32_MAX) { fprintf(stderr, "ds4: CUDA expert cache: no eviction victim (layer %u, mode %d)\n", table->layer, g_wave_mode); return 0; }
             auto &slot = g_stream_expert_slots[victim];
             if (slot.used) { cuda_slot_table_note(slot.gate, -1); g_stream_expert_by_gate.erase(slot.gate); }
             slot.used = 0;
@@ -29728,7 +29831,7 @@ static int cuda_stream_selected_cache_begin_load(
             char *const d_down = cache.down_ptr + (uint64_t)victim * table->down_expert_bytes;
             const int htier = cuda_host_expert_tier_load(d_gate, d_up, d_down,
                                                          table, gate, up, down);
-            if (htier == 0) return 0;
+            if (htier == 0) { fprintf(stderr, "ds4: begin_load: host tier load failed (layer %u, mode %d)\n", table->layer, g_wave_mode); return 0; }
             if (htier < 0 && batch_max > 1u) {
                 /* Claim the slot now so the next victim search cannot pick it again, then
                  * read it as part of the batch. */
@@ -29748,7 +29851,7 @@ static int cuda_stream_selected_cache_begin_load(
                 cache.up_ptr   + (uint64_t)victim * table->gate_expert_bytes, up,   table->gate_expert_bytes,
                 cache.down_ptr + (uint64_t)victim * table->down_expert_bytes, down, table->down_expert_bytes,
                 table->model_map, table->model_size, uploads.chunks);
-            if (par == 0) return 0;
+            if (par == 0) { fprintf(stderr, "ds4: begin_load: parallel expert read failed (layer %u, mode %d)\n", table->layer, g_wave_mode); return 0; }
             if (par < 0 && (!cuda_model_copy_to_device_streamed(
                     cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes,
                     table->model_map, table->model_size, gate, table->gate_expert_bytes, "stream gate", uploads.chunks) ||
@@ -29765,7 +29868,7 @@ static int cuda_stream_selected_cache_begin_load(
             slots[i] = (int32_t)victim;
             filled.push_back(victim);
         }
-        if (!flush_pend()) return 0;
+        if (!flush_pend()) { fprintf(stderr, "ds4: begin_load: batched read flush failed (layer %u)\n", table->layer); return 0; }
         g_ph_victim_ms += t_vic;
         const double t_ld = cuda_now_ms() - t_ld0;
         const double t_up0 = cuda_now_ms();
@@ -29783,7 +29886,7 @@ static int cuda_stream_selected_cache_begin_load(
                 async_wait = true;
             }
         }
-        if (!async_wait && !uploads.finish()) return 0;
+        if (!async_wait && !uploads.finish()) { fprintf(stderr, "ds4: begin_load: upload finish failed (layer %u, mode %d)\n", table->layer, g_wave_mode); return 0; }
         const double t_up = cuda_now_ms() - t_up0;
         g_ph_upload_ms += t_up;
         if (slot_count == 6u) { g_pd_load_ms += t_ld; g_pd_upload_ms += t_up; g_pd_misses += (uint64_t)filled.size(); }
@@ -29791,7 +29894,16 @@ static int cuda_stream_selected_cache_begin_load(
             for (uint32_t v : filled) if (v < g_stream_expert_slots.size()) g_stream_expert_slots[v].used = 2;
         g_stream_prefill_ids = remap;
         g_stream_prefill_slots = slots;
-        for (auto &id : remap) id = slots[id];
+        if (g_wave_mode == 2) {
+            g_wave_full_remap.resize(slot_count);
+            for (uint32_t p = 0; p < slot_count; p++) {
+                const int32_t u = remap[p];
+                g_wave_full_remap[p] = slots[u];
+                remap[p] = wave_was_hit[u] ? -1 : slots[u];   /* pass 2: the loaded experts only */
+            }
+        } else {
+            for (auto &id : remap) id = slots[id];
+        }
         {
             const double t_rm0 = cuda_now_ms();
             int rm_ok;
