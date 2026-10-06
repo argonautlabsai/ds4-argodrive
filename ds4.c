@@ -40412,6 +40412,12 @@ fail:
 }
 #undef DS41_SCRATCH
 
+/* DS4_CUDA_BF16_FOLD=1 (spec31): the producer kernels round in their epilogue; skip the rounding launch. */
+static bool ds41_bf16_fold(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DS4_CUDA_BF16_FOLD"); on = e && strcmp(e, "0") != 0; }
+    return on;
+}
 static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
     return ds4_gpu_dsv41_quantize(x, width, 1, DS4_V41_BF16) != 0;
 }
@@ -40544,6 +40550,9 @@ static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
 
 static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                       const ds4_model *m, const ds4_tensor *weight) {
+    if (ds41_bf16_fold())
+        return ds4_gpu_rms_norm_weight_bf16_tensor(out, in, m->map, m->size,
+            weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) != 0;
     return ds4_gpu_rms_norm_weight_tensor(out, in, m->map, m->size,
         weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) &&
         ds41_bf16(out, (uint32_t)weight->dim[0]);
@@ -40859,6 +40868,8 @@ static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) {
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     if (!ds41_sum_partial(g, routed, il, DS4_TP_GATE_FFN)) return false;
+    if (!shared_owner && ds41_bf16_fold())
+        return ds4_gpu_add_bf16_tensor(g->block, routed, g->shared, DS4_N_EMBD) != 0;
     return (shared_owner || ds4_gpu_add_tensor(g->block, routed, g->shared, DS4_N_EMBD)) &&
         ds41_bf16(g->block, DS4_N_EMBD);
 }
@@ -40890,17 +40901,26 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
             return false;
     }
     return ds41_hc_mix(g, m, l, false) &&
-        ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->attn_norm);
+        (ds41_bf16_fold()
+            ? ds4_gpu_hc_weighted_sum_bf16_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) != 0
+            : (ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
+               ds41_bf16(g->x, DS4_N_EMBD))) &&
+        ds41_norm(g->norm, g->x, m, l->attn_norm);
 }
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
                                       const ds4_layer_weights *l) {
-    return ds4_gpu_hc_expand_split_tensor(g->after_attn, g->block, g->residual, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->after_attn, DS4_N_EMBD * DS4_N_HC) &&
+    const bool fold = ds41_bf16_fold();
+    return (fold
+            ? ds4_gpu_hc_expand_split_bf16_tensor(g->after_attn, g->block, g->residual, g->attn_split, DS4_N_EMBD, DS4_N_HC) != 0
+            : (ds4_gpu_hc_expand_split_tensor(g->after_attn, g->block, g->residual, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
+               ds41_bf16(g->after_attn, DS4_N_EMBD * DS4_N_HC))) &&
         ds41_hc_mix(g, m, l, true) &&
-        ds4_gpu_hc_weighted_sum_split_tensor(g->x, g->after_attn, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->ffn_norm);
+        (fold
+            ? ds4_gpu_hc_weighted_sum_split_bf16_tensor(g->x, g->after_attn, g->attn_split, DS4_N_EMBD, DS4_N_HC) != 0
+            : (ds4_gpu_hc_weighted_sum_split_tensor(g->x, g->after_attn, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
+               ds41_bf16(g->x, DS4_N_EMBD))) &&
+        ds41_norm(g->norm, g->x, m, l->ffn_norm);
 }
 
 static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
@@ -41180,8 +41200,10 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
-    return ds4_gpu_hc_expand_split_tensor(g->residual, g->block, g->after_attn, g->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->residual, DS4_N_EMBD * DS4_N_HC) &&
+    return (ds41_bf16_fold()
+            ? ds4_gpu_hc_expand_split_bf16_tensor(g->residual, g->block, g->after_attn, g->ffn_split, DS4_N_EMBD, DS4_N_HC) != 0
+            : (ds4_gpu_hc_expand_split_tensor(g->residual, g->block, g->after_attn, g->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
+               ds41_bf16(g->residual, DS4_N_EMBD * DS4_N_HC))) &&
         ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
 }
 
@@ -41365,7 +41387,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         /* TP gates already submit ordered, bounded command buffers. Drain
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
-        const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
+        /* DS4_CUDA_NO_LAYER_DRAIN=1 (spec30): on a single GPU the per-layer device sync only makes
+         * the host idle through the MoE tail; the expert loader syncs the stream itself before it
+         * touches any slot, so draining at layer 13 (Engram input) and at the last layer suffices. */
+        static int no_layer_drain = -1;
+        if (no_layer_drain < 0) { const char *e = getenv("DS4_CUDA_NO_LAYER_DRAIN"); no_layer_drain = e && strcmp(e, "0") != 0; }
+        const bool drain = (!queue_layers && !no_layer_drain) || il == 13 || il + 1u == DS4_N_LAYER;
         if (drain && !ds4_gpu_end_commands()) ok = false;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
@@ -41710,6 +41737,22 @@ static bool ds41_engram_prefetch_start(ds41_engram_prefetch *p, ds41_gpu_graph *
 }
 
 static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) {
+    /* DS4_CUDA_PREFILL_CHUNK_TOKENS=N (spec29): prefill in chunks of up to N tokens (capped at
+     * prefill_cap). The sweep is layer-major per chunk and the VRAM expert cache holds far fewer
+     * experts than one chunk touches across all layers, so every extra chunk re-reads each layer's
+     * missing experts from disk; fewer, larger chunks mean fewer reads. */
+    static long env_chunk = -1;
+    if (env_chunk < 0) {
+        const char *e = getenv("DS4_CUDA_PREFILL_CHUNK_TOKENS");
+        env_chunk = (e && e[0]) ? strtol(e, NULL, 10) : 0;
+        if (env_chunk < 0) env_chunk = 0;
+    }
+    if (env_chunk > 0) {
+        uint32_t c = (uint32_t)env_chunk;
+        if (c > g->prefill_cap) c = g->prefill_cap;
+        if (c < 64u) c = 64u;
+        return c;
+    }
     if (count < 8192u && g->prefill_cap > 2048u) return 2048u;
     /* Keep the decoder suffix optimization for 8k prompts. */
     if (count < 16384u && g->prefill_cap > 4096u) return 4096u;
