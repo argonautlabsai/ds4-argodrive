@@ -33575,7 +33575,12 @@ static uint32_t metal_graph_streaming_decode_prefill_max_tokens(
         DS4_MODEL_VARIANT != DS4_VARIANT_FLASH) {
         return 0u;
     }
-    return metal_graph_streaming_decode_prefill_wide_default(weights) ? 64u : 18u;
+    {
+        static int logged = 0;
+        const uint32_t v = metal_graph_streaming_decode_prefill_wide_default(weights) ? 64u : 18u;
+        if (!logged) { logged = 1; fprintf(stderr, "ds4: streaming decode-style prefill threshold: tails of <= %u tokens take the single-token path\n", v); }
+        return v;
+    }
 }
 
 static bool metal_graph_use_streaming_decode_prefill(

@@ -232,6 +232,36 @@ static int cuda_prefill_waves(void) {
  * phase (index, loads, DMA wait, remap); load = read+issue part; upload = DMA wait. */
 static uint64_t g_pd_layers = 0, g_pd_misses = 0;
 static double g_pd_readback_ms = 0, g_pd_begin_ms = 0, g_pd_load_ms = 0, g_pd_upload_ms = 0;
+static double cuda_now_ms(void);
+static uint64_t g_pack_reads = 0;   /* spec33: experts fetched from the contiguous pack */
+/* spec32 audit counters. Prefill sweep summary (slot_count > 6): per layer tokens, unique experts,
+ * misses split by source; printed at the last layer of each sweep. Replica tails: per component read,
+ * how long the array piece and the replica pieces took and which finished last. */
+static uint64_t g_pf_layers = 0, g_pf_tokens = 0, g_pf_unique = 0, g_pf_pool = 0, g_pf_nvme = 0;
+static double g_pf_load_ms = 0;
+static uint64_t g_rt_split_n = 0, g_rt_primary_last = 0, g_rt_replica_last = 0, g_rt_full_n = 0;
+static double g_rt_primary_ms = 0, g_rt_replica_ms = 0, g_rt_full_ms = 0, g_rt_primary_max = 0, g_rt_replica_max = 0, g_rt_full_max = 0;
+static uint64_t g_rt_primary_slow = 0, g_rt_replica_slow = 0, g_rt_full_slow = 0; /* > 1.0 ms */
+static void cuda_replica_tail_report(void) {
+    if (g_rt_split_n + g_rt_full_n == 0) return;
+    fprintf(stderr, "ds4: expert read tails: %llu split component reads (gate/up): array piece avg %.3f ms max %.3f (%llu >1ms), "
+                    "replica pieces avg %.3f ms max %.3f (%llu >1ms), array finished last in %.1f%%; %llu array-only component reads (down): avg %.3f ms max %.3f (%llu >1ms)\n",
+            (unsigned long long)g_rt_split_n,
+            g_rt_split_n ? g_rt_primary_ms / (double)g_rt_split_n : 0.0, g_rt_primary_max, (unsigned long long)g_rt_primary_slow,
+            g_rt_split_n ? g_rt_replica_ms / (double)g_rt_split_n : 0.0, g_rt_replica_max, (unsigned long long)g_rt_replica_slow,
+            g_rt_split_n ? 100.0 * (double)g_rt_primary_last / (double)g_rt_split_n : 0.0,
+            (unsigned long long)g_rt_full_n, g_rt_full_n ? g_rt_full_ms / (double)g_rt_full_n : 0.0, g_rt_full_max, (unsigned long long)g_rt_full_slow);
+    (void)fflush(stderr);
+}
+static void cuda_prefill_sweep_report(void) {
+    if (!g_pf_layers) return;
+    fprintf(stderr, "ds4: prefill sweep: %llu layer-chunks, %.0f tokens/layer-chunk, unique experts/layer %.1f, misses/layer %.1f (pool %.1f, NVMe %.1f), load+DMA %.1f ms/layer\n",
+            (unsigned long long)g_pf_layers, (double)g_pf_tokens / (double)g_pf_layers, (double)g_pf_unique / (double)g_pf_layers,
+            (double)(g_pf_pool + g_pf_nvme) / (double)g_pf_layers, (double)g_pf_pool / (double)g_pf_layers, (double)g_pf_nvme / (double)g_pf_layers,
+            g_pf_load_ms / (double)g_pf_layers);
+    (void)fflush(stderr);
+    g_pf_layers = g_pf_tokens = g_pf_unique = g_pf_pool = g_pf_nvme = 0; g_pf_load_ms = 0;
+}
 static void cuda_decode_partition_report(void) {
     if (!g_pd_layers) return;
     fprintf(stderr, "ds4: decode partition over %llu layers (%.2f misses/layer): per layer readback %.3f ms, "
@@ -240,7 +270,9 @@ static void cuda_decode_partition_report(void) {
             g_pd_readback_ms / (double)g_pd_layers, g_pd_begin_ms / (double)g_pd_layers,
             g_pd_load_ms / (double)g_pd_layers, g_pd_upload_ms / (double)g_pd_layers,
             40.0 * g_pd_readback_ms / (double)g_pd_layers, 40.0 * g_pd_begin_ms / (double)g_pd_layers);
+    if (g_pack_reads) fprintf(stderr, "ds4: expert pack reads so far: %llu\n", (unsigned long long)g_pack_reads);
     (void)fflush(stderr);
+    cuda_replica_tail_report();
 }
 static int g_remap_via_upload_stream = 0; /* begin_load: write the remap through the upload stream (legacy stream is gated) */
 static uint64_t g_chunked_reads = 0, g_chunked_pieces = 0; /* DS4_CUDA_EXPERT_CHUNKS statistics */
@@ -2773,8 +2805,13 @@ static int cuda_replica_read(int primary_fd, void *dst_v, uint64_t length, uint6
     for (size_t i = 1; i < n; i++)
         if (piece_len[i] && !cuda_replica_covers(g_replica_src[i], piece_off[i], piece_len[i])) { split = false; g_replica_src[i].skipped++; }
     if (!split || blocks < 2) {
+        const double t0 = cuda_now_ms();
         const int ok = cuda_pread_full(primary_fd, dst, length, offset);
         if (ok) g_replica_src[0].bytes += length;
+        if (t_in_expert_read) {
+            const double dt = cuda_now_ms() - t0;
+            g_rt_full_n++; g_rt_full_ms += dt; if (dt > g_rt_full_max) g_rt_full_max = dt; if (dt > 1.0) g_rt_full_slow++;
+        }
         return ok;
     }
     g_replica_reads_split++;
@@ -2790,11 +2827,24 @@ static int cuda_replica_read(int primary_fd, void *dst_v, uint64_t length, uint6
     pthread_cond_broadcast(&g_replica_cv_work);
     pthread_mutex_unlock(&g_replica_mu);
     int ok = 1;
+    const double t_issue = cuda_now_ms();
     if (piece_len[0]) { ok = cuda_pread_full(primary_fd, dst, piece_len[0], piece_off[0]); g_replica_src[0].bytes += piece_len[0]; }
+    const double t_primary = cuda_now_ms() - t_issue;
     pthread_mutex_lock(&mu);
+    const int replica_done_first = left == 0;
     while (left > 0) pthread_cond_wait(&cv, &mu);
     if (left < 0) ok = 0;
     pthread_mutex_unlock(&mu);
+    const double t_all = cuda_now_ms() - t_issue;
+    if (t_in_expert_read) {
+        const double t_replica = replica_done_first ? t_primary : t_all;
+        g_rt_split_n++; g_rt_primary_ms += t_primary; g_rt_replica_ms += t_replica;
+        if (t_primary > g_rt_primary_max) g_rt_primary_max = t_primary;
+        if (t_replica > g_rt_replica_max) g_rt_replica_max = t_replica;
+        if (t_primary > 1.0) g_rt_primary_slow++;
+        if (t_replica > 1.0) g_rt_replica_slow++;
+        if (replica_done_first) g_rt_primary_last++; else g_rt_replica_last++;
+    }
     return ok;
 }
 
@@ -3214,6 +3264,67 @@ static int cuda_model_copy_experts_batched(const cuda_batch_expert *ex, uint32_t
         }
     }
     chunk_idx += n_read;
+    return 1;
+}
+
+/* DS4_CUDA_EXPERT_PACK=<file> (spec33): an expert-contiguous copy of the routed experts (gate|up|down of
+ * each expert adjacent, 3 x 6.33 MiB), with <file>.idx listing "layer gate_base up_base down_base" so the
+ * layer is found from the table's gate offset. A miss is then ONE 19 MiB O_DIRECT read instead of three
+ * concurrent component reads; the offline replay measured 0.96 vs 1.28 ms per expert. Falls back to the
+ * component path on any failure. Same bytes land in the same slots, so the output is unchanged. */
+static int g_pack_fd = -1, g_pack_state = 0;
+static uint64_t g_pack_layer_gate[64];
+static int cuda_pack_init(void) {
+    if (g_pack_state) return g_pack_state;
+    const char *p = getenv("DS4_CUDA_EXPERT_PACK");
+    if (!p || !p[0]) { g_pack_state = -1; return -1; }
+    int fd = open(p, O_RDONLY | O_DIRECT);
+    if (fd < 0) { fprintf(stderr, "ds4: expert pack %s: %s\n", p, strerror(errno)); g_pack_state = -1; return -1; }
+    std::string ip = std::string(p) + ".idx";
+    FILE *f = fopen(ip.c_str(), "r");
+    if (!f) { fprintf(stderr, "ds4: expert pack index %s: %s\n", ip.c_str(), strerror(errno)); close(fd); g_pack_state = -1; return -1; }
+    memset(g_pack_layer_gate, 0, sizeof(g_pack_layer_gate));
+    unsigned L; unsigned long long g, u, d; int n = 0;
+    while (fscanf(f, "%u %llu %llu %llu", &L, &g, &u, &d) == 4) if (L < 64u) { g_pack_layer_gate[L] = g; n++; }
+    fclose(f);
+    g_pack_fd = fd; g_pack_state = 1;
+    fprintf(stderr, "ds4: expert pack on: %s (%d layers indexed)\n", p, n);
+    return 1;
+}
+static int cuda_pack_layer_for(uint64_t gate_offset) {
+    for (int L = 0; L < 64; L++) if (g_pack_layer_gate[L] && g_pack_layer_gate[L] == gate_offset) return L;
+    return -1;
+}
+/* 1 = done (uploads queued), 0 = pack unavailable or failed (caller falls back). */
+static int cuda_model_copy_expert_pack(int pack_layer, uint32_t expert, uint32_t n_total_expert,
+                                       char *dst_g, char *dst_u, char *dst_d, uint64_t comp_bytes, uint64_t &chunk_idx) {
+    const uint64_t total = 3u * comp_bytes;
+    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    if (g_pack_fd < 0 || total > chunk) return 0;
+    if (!cuda_stream_selected_stage_pool_alloc(chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1))) return 0;
+    const uint64_t ring = (uint64_t)cuda_stage_ring();
+    const uint64_t bi = chunk_idx % ring;
+    if (chunk_idx >= ring && cudaEventSynchronize(g_stream_selected_stage_event[bi]) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    char *stage = (char *)g_stream_selected_stage[bi];
+    const uint64_t off = ((uint64_t)pack_layer * n_total_expert + expert) * total;
+    t_in_expert_read = 1;
+    const int ok = cuda_pread_range(g_pack_fd, stage, total, off);
+    t_in_expert_read = 0;
+    if (!ok) {
+        static int warned = 0;
+        if (!warned) { warned = 1; fprintf(stderr, "ds4: expert pack read failed (layer %d expert %u): %s; falling back\n", pack_layer, expert, strerror(errno)); }
+        return 0;
+    }
+    cudaStream_t st = cuda_upload_stream_for(0);
+    if (cudaMemcpyAsync(dst_g, stage, (size_t)comp_bytes, cudaMemcpyHostToDevice, st) != cudaSuccess ||
+        cudaMemcpyAsync(dst_u, stage + comp_bytes, (size_t)comp_bytes, cudaMemcpyHostToDevice, st) != cudaSuccess ||
+        cudaMemcpyAsync(dst_d, stage + 2u * comp_bytes, (size_t)comp_bytes, cudaMemcpyHostToDevice, st) != cudaSuccess ||
+        cudaEventRecord(g_stream_selected_stage_event[bi], st) != cudaSuccess) {
+        fprintf(stderr, "ds4: expert pack upload failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+        return 0;
+    }
+    chunk_idx += 1u;
+    g_pack_reads++;
     return 1;
 }
 
@@ -29911,6 +30022,7 @@ static int cuda_stream_selected_cache_begin_load(
             const int htier = cuda_host_expert_tier_load(d_gate, d_up, d_down,
                                                          table, gate, up, down);
             if (htier == 0) { fprintf(stderr, "ds4: begin_load: host tier load failed (layer %u, mode %d)\n", table->layer, g_wave_mode); return 0; }
+            if (slot_count > 6u) { if (htier > 0) g_pf_pool++; else g_pf_nvme++; }
             if (htier < 0 && batch_max > 1u) {
                 /* Claim the slot now so the next victim search cannot pick it again, then
                  * read it as part of the batch. */
@@ -29925,7 +30037,13 @@ static int cuda_stream_selected_cache_begin_load(
                 if (pend.size() >= (size_t)batch_max && !flush_pend()) return 0;
                 continue;
             }
-            const int par = (htier > 0) ? 1 : cuda_model_copy_expert_parallel(
+            int par = (htier > 0) ? 1 : 0;
+            if (!par && cuda_pack_init() > 0 && table->gate_expert_bytes == table->down_expert_bytes) {
+                const int pl = cuda_pack_layer_for(table->gate_offset);
+                if (pl >= 0) par = cuda_model_copy_expert_pack(pl, (uint32_t)expert, table->n_total_expert,
+                                                              d_gate, d_up, d_down, table->gate_expert_bytes, uploads.chunks);
+            }
+            if (!par) par = cuda_model_copy_expert_parallel(
                 cache.gate_ptr + (uint64_t)victim * table->gate_expert_bytes, gate, table->gate_expert_bytes,
                 cache.up_ptr   + (uint64_t)victim * table->gate_expert_bytes, up,   table->gate_expert_bytes,
                 cache.down_ptr + (uint64_t)victim * table->down_expert_bytes, down, table->down_expert_bytes,
@@ -29969,6 +30087,10 @@ static int cuda_stream_selected_cache_begin_load(
         const double t_up = cuda_now_ms() - t_up0;
         g_ph_upload_ms += t_up;
         if (slot_count == 6u) { g_pd_load_ms += t_ld; g_pd_upload_ms += t_up; g_pd_misses += (uint64_t)filled.size(); }
+        if (slot_count > 6u && g_wave_mode != 1) {
+            g_pf_layers++; g_pf_tokens += slot_count / 6u; g_pf_unique += unique.size(); g_pf_load_ms += t_ld + t_up;
+            if (table->layer + 1u >= 40u) cuda_prefill_sweep_report();
+        }
         if (slot_count > 6u && cuda_prefill_cold())
             for (uint32_t v : filled) if (v < g_stream_expert_slots.size()) g_stream_expert_slots[v].used = 2;
         g_stream_prefill_ids = remap;
