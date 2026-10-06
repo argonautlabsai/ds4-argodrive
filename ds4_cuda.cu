@@ -194,13 +194,24 @@ static inline uint64_t cuda_slot_eff_age(const cuda_stream_expert_slot &s) {
     const uint64_t b = cuda_pool_evict_bias();
     return s.used > b + 2 ? s.used - b : 2;
 }
-/* DS4_CUDA_PREFILL_COLD=1: experts loaded by prefill are demoted to used=2 once the
- * layer's uploads have landed, so a prompt's one-shot expert traffic is evicted
- * before the decode working set instead of flushing it. */
+/* DS4_CUDA_PREFILL_COLD=1: experts loaded by prefill are demoted once the layer's uploads have
+ * landed, so a prompt's one-shot expert traffic is evicted before the decode working set instead of
+ * flushing it. DS4_CUDA_PREFILL_COLD_AGE=N sets the stamp they are demoted to (default 2, the
+ * oldest a live slot can be): a larger value keeps them in VRAM longer, which is what a follow-up
+ * turn on the same conversation needs, at the cost of the decode working set's residency. */
 static int cuda_prefill_cold(void) {
     static int checked = 0, on = 0;
     if (!checked) { const char *e = getenv("DS4_CUDA_PREFILL_COLD"); on = e && strcmp(e, "0") != 0; checked = 1; }
     return on;
+}
+static uint64_t cuda_prefill_cold_age(void) {
+    static uint64_t age = 0;
+    if (!age) {
+        const char *e = getenv("DS4_CUDA_PREFILL_COLD_AGE");
+        long v = (e && e[0]) ? strtol(e, NULL, 10) : 2;
+        age = v < 2 ? 2u : (uint64_t)v;
+    }
+    return age;
 }
 static std::vector<cuda_stream_expert_slot> g_stream_expert_slots;
 static std::unordered_map<uint64_t, uint32_t> g_stream_expert_by_gate;
@@ -30091,8 +30102,13 @@ static int cuda_stream_selected_cache_begin_load(
             g_pf_layers++; g_pf_tokens += slot_count / 6u; g_pf_unique += unique.size(); g_pf_load_ms += t_ld + t_up;
             if (table->layer + 1u >= 40u) cuda_prefill_sweep_report();
         }
-        if (slot_count > 6u && cuda_prefill_cold())
-            for (uint32_t v : filled) if (v < g_stream_expert_slots.size()) g_stream_expert_slots[v].used = 2;
+        if (slot_count > 6u && cuda_prefill_cold()) {
+            /* Never raise a slot's stamp: the demotion must not look like a fresh touch. */
+            const uint64_t cold = cuda_prefill_cold_age();
+            for (uint32_t v : filled)
+                if (v < g_stream_expert_slots.size() && g_stream_expert_slots[v].used > cold)
+                    g_stream_expert_slots[v].used = cold;
+        }
         g_stream_prefill_ids = remap;
         g_stream_prefill_slots = slots;
         if (g_wave_mode == 2) {
