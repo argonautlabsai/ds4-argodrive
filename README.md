@@ -1,5 +1,14 @@
 # DS4 Argodrive — DeepSeek V4.1 on three SSDs
 
+**Two platforms, two champions, both output-identical to the unmodified engine.** This fork carries two lines of work on DeepSeek V4.1 Flash Q4 (518.6 GB) with experts streamed from SSD: the Apple Silicon / Metal line on this branch, and a CUDA line for a single NVIDIA RTX PRO 6000 on branch [`cuda-host-expert-pool`](https://github.com/argonautlabsai/ds4-argodrive/tree/cuda-host-expert-pool).
+
+| Platform | Prompt processing | Steady decode | Evidence |
+|---|---:|---:|---|
+| Apple M5 Max 128 GiB, Metal; internal SSD plus two Thunderbolt 5 NVMe enclosures; 512-token prompt | **75.06 tok/s** on three drives (4.34× pinned upstream), 47.71 on one SSD — 4 Oct 2026 | **23.26 tok/s** at 512 generated tokens, fixed 4,600-expert cache — 28 Sep 2026 | [v41-stack-20261004](https://github.com/argonautlabsai/ds4-argodrive/releases/tag/v41-stack-20261004) · [v41-stack-20260928](https://github.com/argonautlabsai/ds4-argodrive/releases/tag/v41-stack-20260928) |
+| NVIDIA RTX PRO 6000 Blackwell 96 GB, CUDA; experts streamed from a 3× NVMe RAID0 array through a VM, 40 GB host-RAM expert pool, context 32,768 | **~208 tok/s** on 512-token prompts (from 143), **~350** on 4,916-token prompts (from 200) — 5 Oct 2026 | **~20–22 tok/s**, strict metric, on 512-token prompts (from 17.1 at the start of the series) | [v41-cuda-20261006](https://github.com/argonautlabsai/ds4-argodrive/releases/tag/v41-cuda-20261006) · [results, every lever measured](https://github.com/argonautlabsai/ds4-argodrive/blob/cuda-host-expert-pool/argodrive/cuda/RESULTS-2026-09-30.md) |
+
+The two lines use different harnesses (this repository's paired-arm harness for Metal; OpenAI-compatible requests against the server, five fixed prompts per arm, A/B/B/A, for CUDA), so each row compares a platform with its own unmodified baseline, not the platforms with each other.
+
 **23.260 steady tok/s at 512 generated tokens; 22.755 generation-inclusive tok/s.** DeepSeek V4.1 Flash Q4 (518.6 GB), M5 Max with 128 GiB, internal SSD plus two Thunderbolt 5 NVMe enclosures; 512-token prompt. Measured on 28 September against the published 27 September binary, built from its tag and run in the same session with the same profile and 4,600-expert cache: **+1.48% steady / +1.27% inclusive** at 512 generated tokens (BAAB, two runs per configuration) and **+1.71%** at 200 (ABBA). Same drives and model copies; byte-identical reference outputs on every arm, zero swap growth, GPU clocks held at 1,620 MHz.
 
 ![Matched 512-token steady and inclusive results](argodrive/candidates/2026-09-28-flush/comparison.svg)
