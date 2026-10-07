@@ -77,7 +77,11 @@ extern "C" int ds4_gpu_dsv41_shared_start(
         const void *model_map, uint64_t model_size,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         uint32_t width, uint32_t hidden, float clamp) {
-    if (!ds4_gpu_device_is_spark()) return 0;
+    /* DS4_CUDA_SHARED_ASYNC=1 lets discrete GPUs use this path too: with SSD
+     * streaming the shared expert then runs while the host loads routed experts. */
+    static int async_env = -1;
+    if (async_env < 0) { const char *e = getenv("DS4_CUDA_SHARED_ASYNC"); async_env = e && strcmp(e, "0") != 0; }
+    if (!ds4_gpu_device_is_spark() && !async_env) return 0;
     if (g_dsv41_shared.active || g_dsv41_shared.pending || !width || !hidden ||
         !dsv41_has_floats(x, width) || !dsv41_has_floats(out, width) ||
         !dsv41_has_floats(gate, hidden) || !dsv41_has_floats(up, hidden) ||
